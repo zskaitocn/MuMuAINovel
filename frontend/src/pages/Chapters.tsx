@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { List, Button, Modal, Form, Input, Select, message, Empty, Space, Badge, Tag, Card, Tooltip, InputNumber, Alert, Radio, Descriptions, Collapse, Popconfirm, FloatButton } from 'antd';
-import { EditOutlined, FileTextOutlined, ThunderboltOutlined, LockOutlined, DownloadOutlined, SettingOutlined, FundOutlined, SyncOutlined, CheckCircleOutlined, CloseCircleOutlined, RocketOutlined, StopOutlined, InfoCircleOutlined, CaretRightOutlined, DeleteOutlined, BookOutlined, FormOutlined, PlusOutlined } from '@ant-design/icons';
+import { List, Button, Modal, Form, Input, Select, message, Empty, Space, Badge, Tag, Card, InputNumber, Alert, Radio, Descriptions, Collapse, Popconfirm, FloatButton } from 'antd';
+import { EditOutlined, FileTextOutlined, ThunderboltOutlined, LockOutlined, DownloadOutlined, SettingOutlined, FundOutlined, SyncOutlined, CheckCircleOutlined, CloseCircleOutlined, RocketOutlined, StopOutlined, InfoCircleOutlined, CaretRightOutlined, DeleteOutlined, BookOutlined, FormOutlined, PlusOutlined, ReadOutlined } from '@ant-design/icons';
 import { useStore } from '../store';
 import { useChapterSync } from '../store/hooks';
 import { projectApi, writingStyleApi, chapterApi } from '../services/api';
@@ -10,6 +10,7 @@ import ExpansionPlanEditor from '../components/ExpansionPlanEditor';
 import { SSELoadingOverlay } from '../components/SSELoadingOverlay';
 import { SSEProgressModal } from '../components/SSEProgressModal';
 import FloatingIndexPanel from '../components/FloatingIndexPanel';
+import ChapterReader from '../components/ChapterReader';
 
 const { TextArea } = Input;
 
@@ -38,6 +39,10 @@ export default function Chapters() {
   const [analysisTasksMap, setAnalysisTasksMap] = useState<Record<string, AnalysisTask>>({});
   const pollingIntervalsRef = useRef<Record<string, number>>({});
   const [isIndexPanelVisible, setIsIndexPanelVisible] = useState(false);
+
+  // 阅读器状态
+  const [readerVisible, setReaderVisible] = useState(false);
+  const [readingChapter, setReadingChapter] = useState<Chapter | null>(null);
 
   // 规划编辑状态
   const [planEditorVisible, setPlanEditorVisible] = useState(false);
@@ -101,12 +106,14 @@ export default function Chapters() {
   }, []);
 
   // 加载所有章节的分析任务状态
-  const loadAnalysisTasks = async () => {
-    if (!chapters || chapters.length === 0) return;
+  // 接受可选的 chaptersToLoad 参数，解决 React 状态更新延迟导致的问题
+  const loadAnalysisTasks = async (chaptersToLoad?: typeof chapters) => {
+    const targetChapters = chaptersToLoad || chapters;
+    if (!targetChapters || targetChapters.length === 0) return;
 
     const tasksMap: Record<string, AnalysisTask> = {};
 
-    for (const chapter of chapters) {
+    for (const chapter of targetChapters) {
       // 只查询有内容的章节
       if (chapter.content && chapter.content.trim() !== '') {
         try {
@@ -805,9 +812,10 @@ export default function Chapters() {
         });
 
         // 每次轮询时刷新章节列表和分析状态，实时显示新生成的章节和分析进度
+        // 使用 await 确保获取最新章节列表后再加载分析任务状态
         if (status.completed > 0) {
-          refreshChapters();
-          loadAnalysisTasks();
+          const latestChapters = await refreshChapters();
+          await loadAnalysisTasks(latestChapters);
 
           // 刷新项目信息以实时更新总字数统计
           if (currentProject?.id) {
@@ -826,8 +834,9 @@ export default function Chapters() {
           setBatchGenerating(false);
 
           // 立即刷新章节列表和分析任务状态（在显示消息前）
-          await refreshChapters();
-          await loadAnalysisTasks();
+          // 使用 refreshChapters 返回的最新章节列表传递给 loadAnalysisTasks
+          const finalChapters = await refreshChapters();
+          await loadAnalysisTasks(finalChapters);
 
           // 刷新项目信息以更新总字数统计
           if (currentProject?.id) {
@@ -1166,11 +1175,9 @@ export default function Chapters() {
         );
       case 'failed':
         return (
-          <Tooltip title={task.error_message}>
-            <Tag icon={<CloseCircleOutlined />} color="error">
-              分析失败
-            </Tag>
-          </Tooltip>
+          <Tag icon={<CloseCircleOutlined />} color="error" title={task.error_message || undefined}>
+            分析失败
+          </Tag>
         );
       default:
         return null;
@@ -1474,6 +1481,24 @@ export default function Chapters() {
     }
   };
 
+  // 打开阅读器
+  const handleOpenReader = (chapter: Chapter) => {
+    setReadingChapter(chapter);
+    setReaderVisible(true);
+  };
+
+  // 阅读器切换章节
+  const handleReaderChapterChange = async (chapterId: string) => {
+    try {
+      const response = await fetch(`/api/chapters/${chapterId}`);
+      if (!response.ok) throw new Error('获取章节失败');
+      const newChapter = await response.json();
+      setReadingChapter(newChapter);
+    } catch {
+      message.error('加载章节失败');
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {contextHolder}
@@ -1491,7 +1516,10 @@ export default function Chapters() {
         justifyContent: 'space-between',
         alignItems: isMobile ? 'stretch' : 'center'
       }}>
-        <h2 style={{ margin: 0, fontSize: isMobile ? 18 : 24 }}>章节管理</h2>
+        <h2 style={{ margin: 0, fontSize: isMobile ? 18 : 24 }}>
+          <BookOutlined style={{ marginRight: 8 }} />
+          章节管理
+        </h2>
         <Space direction={isMobile ? 'vertical' : 'horizontal'} style={{ width: isMobile ? '100%' : 'auto' }}>
           {currentProject.outline_mode === 'one-to-many' && (
             <Button
@@ -1556,6 +1584,15 @@ export default function Chapters() {
                 actions={isMobile ? undefined : [
                   <Button
                     type="text"
+                    icon={<ReadOutlined />}
+                    onClick={() => handleOpenReader(item)}
+                    disabled={!item.content || item.content.trim() === ''}
+                    title={!item.content || item.content.trim() === '' ? '暂无内容' : '沉浸式阅读'}
+                  >
+                    阅读
+                  </Button>,
+                  <Button
+                    type="text"
                     icon={<EditOutlined />}
                     onClick={() => handleOpenEditor(item.id)}
                   >
@@ -1567,23 +1604,20 @@ export default function Chapters() {
                     const hasContent = item.content && item.content.trim() !== '';
 
                     return (
-                      <Tooltip
+                      <Button
+                        type="text"
+                        icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
+                        onClick={() => handleShowAnalysis(item.id)}
+                        disabled={!hasContent || isAnalyzing}
+                        loading={isAnalyzing}
                         title={
                           !hasContent ? '请先生成章节内容' :
                             isAnalyzing ? '分析进行中，请稍候...' :
                               ''
                         }
                       >
-                        <Button
-                          type="text"
-                          icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
-                          onClick={() => handleShowAnalysis(item.id)}
-                          disabled={!hasContent || isAnalyzing}
-                          loading={isAnalyzing}
-                        >
-                          {isAnalyzing ? '分析中' : '查看分析'}
-                        </Button>
-                      </Tooltip>
+                        {isAnalyzing ? '分析中' : '查看分析'}
+                      </Button>
                     );
                   })(),
                   <Button
@@ -1614,11 +1648,9 @@ export default function Chapters() {
                           <Badge count={`${item.word_count || 0}字`} style={{ backgroundColor: 'var(--color-success)' }} />
                           {renderAnalysisStatus(item.id)}
                           {!canGenerateChapter(item) && (
-                            <Tooltip title={getGenerateDisabledReason(item)}>
-                              <Tag icon={<LockOutlined />} color="warning">
-                                需前置章节
-                              </Tag>
-                            </Tooltip>
+                            <Tag icon={<LockOutlined />} color="warning" title={getGenerateDisabledReason(item)}>
+                              需前置章节
+                            </Tag>
                           )}
                         </Space>
                       </div>
@@ -1639,6 +1671,14 @@ export default function Chapters() {
                     <Space style={{ marginTop: 12, width: '100%', justifyContent: 'flex-end' }} wrap>
                       <Button
                         type="text"
+                        icon={<ReadOutlined />}
+                        onClick={() => handleOpenReader(item)}
+                        size="small"
+                        disabled={!item.content || item.content.trim() === ''}
+                        title={!item.content || item.content.trim() === '' ? '暂无内容' : '阅读'}
+                      />
+                      <Button
+                        type="text"
                         icon={<EditOutlined />}
                         onClick={() => handleOpenEditor(item.id)}
                         size="small"
@@ -1650,22 +1690,19 @@ export default function Chapters() {
                         const hasContent = item.content && item.content.trim() !== '';
 
                         return (
-                          <Tooltip
+                          <Button
+                            type="text"
+                            icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
+                            onClick={() => handleShowAnalysis(item.id)}
+                            size="small"
+                            disabled={!hasContent || isAnalyzing}
+                            loading={isAnalyzing}
                             title={
                               !hasContent ? '请先生成章节内容' :
                                 isAnalyzing ? '分析中' :
                                   '查看分析'
                             }
-                          >
-                            <Button
-                              type="text"
-                              icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
-                              onClick={() => handleShowAnalysis(item.id)}
-                              size="small"
-                              disabled={!hasContent || isAnalyzing}
-                              loading={isAnalyzing}
-                            />
-                          </Tooltip>
+                          />
                         );
                       })()}
                       <Button
@@ -1732,6 +1769,15 @@ export default function Chapters() {
                       actions={isMobile ? undefined : [
                         <Button
                           type="text"
+                          icon={<ReadOutlined />}
+                          onClick={() => handleOpenReader(item)}
+                          disabled={!item.content || item.content.trim() === ''}
+                          title={!item.content || item.content.trim() === '' ? '暂无内容' : '沉浸式阅读'}
+                        >
+                          阅读
+                        </Button>,
+                        <Button
+                          type="text"
                           icon={<EditOutlined />}
                           onClick={() => handleOpenEditor(item.id)}
                         >
@@ -1743,23 +1789,20 @@ export default function Chapters() {
                           const hasContent = item.content && item.content.trim() !== '';
 
                           return (
-                            <Tooltip
+                            <Button
+                              type="text"
+                              icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
+                              onClick={() => handleShowAnalysis(item.id)}
+                              disabled={!hasContent || isAnalyzing}
+                              loading={isAnalyzing}
                               title={
                                 !hasContent ? '请先生成章节内容' :
                                   isAnalyzing ? '分析进行中，请稍候...' :
                                     ''
                               }
                             >
-                              <Button
-                                type="text"
-                                icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
-                                onClick={() => handleShowAnalysis(item.id)}
-                                disabled={!hasContent || isAnalyzing}
-                                loading={isAnalyzing}
-                              >
-                                {isAnalyzing ? '分析中' : '查看分析'}
-                              </Button>
-                            </Tooltip>
+                              {isAnalyzing ? '分析中' : '查看分析'}
+                            </Button>
                           );
                         })(),
                         <Button
@@ -1809,33 +1852,29 @@ export default function Chapters() {
                                 <Badge count={`${item.word_count || 0}字`} style={{ backgroundColor: 'var(--color-success)' }} />
                                 {renderAnalysisStatus(item.id)}
                                 {!canGenerateChapter(item) && (
-                                  <Tooltip title={getGenerateDisabledReason(item)}>
-                                    <Tag icon={<LockOutlined />} color="warning">
-                                      需前置章节
-                                    </Tag>
-                                  </Tooltip>
+                                  <Tag icon={<LockOutlined />} color="warning" title={getGenerateDisabledReason(item)}>
+                                    需前置章节
+                                  </Tag>
                                 )}
                                 <Space size={4}>
                                   {item.expansion_plan && (
-                                    <Tooltip title="查看展开详情">
-                                      <InfoCircleOutlined
-                                        style={{ color: 'var(--color-primary)', cursor: 'pointer', fontSize: 16 }}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          showExpansionPlanModal(item);
-                                        }}
-                                      />
-                                    </Tooltip>
-                                  )}
-                                  <Tooltip title={item.expansion_plan ? "编辑规划信息" : "创建规划信息"}>
-                                    <FormOutlined
-                                      style={{ color: 'var(--color-success)', cursor: 'pointer', fontSize: 16 }}
+                                    <InfoCircleOutlined
+                                      title="查看展开详情"
+                                      style={{ color: 'var(--color-primary)', cursor: 'pointer', fontSize: 16 }}
                                       onClick={(e) => {
                                         e.stopPropagation();
-                                        handleOpenPlanEditor(item);
+                                        showExpansionPlanModal(item);
                                       }}
                                     />
-                                  </Tooltip>
+                                  )}
+                                  <FormOutlined
+                                    title={item.expansion_plan ? "编辑规划信息" : "创建规划信息"}
+                                    style={{ color: 'var(--color-success)', cursor: 'pointer', fontSize: 16 }}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleOpenPlanEditor(item);
+                                    }}
+                                  />
                                 </Space>
                               </Space>
                             </div>
@@ -1856,6 +1895,14 @@ export default function Chapters() {
                           <Space style={{ marginTop: 12, width: '100%', justifyContent: 'flex-end' }} wrap>
                             <Button
                               type="text"
+                              icon={<ReadOutlined />}
+                              onClick={() => handleOpenReader(item)}
+                              size="small"
+                              disabled={!item.content || item.content.trim() === ''}
+                              title={!item.content || item.content.trim() === '' ? '暂无内容' : '阅读'}
+                            />
+                            <Button
+                              type="text"
                               icon={<EditOutlined />}
                               onClick={() => handleOpenEditor(item.id)}
                               size="small"
@@ -1867,22 +1914,19 @@ export default function Chapters() {
                               const hasContent = item.content && item.content.trim() !== '';
 
                               return (
-                                <Tooltip
+                                <Button
+                                  type="text"
+                                  icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
+                                  onClick={() => handleShowAnalysis(item.id)}
+                                  size="small"
+                                  disabled={!hasContent || isAnalyzing}
+                                  loading={isAnalyzing}
                                   title={
                                     !hasContent ? '请先生成章节内容' :
                                       isAnalyzing ? '分析中' :
                                         '查看分析'
                                   }
-                                >
-                                  <Button
-                                    type="text"
-                                    icon={isAnalyzing ? <SyncOutlined spin /> : <FundOutlined />}
-                                    onClick={() => handleShowAnalysis(item.id)}
-                                    size="small"
-                                    disabled={!hasContent || isAnalyzing}
-                                    loading={isAnalyzing}
-                                  />
-                                </Tooltip>
+                                />
                               );
                             })()}
                             <Button
@@ -2038,19 +2082,18 @@ export default function Chapters() {
                 const disabledReason = currentChapter ? getGenerateDisabledReason(currentChapter) : '';
 
                 return (
-                  <Tooltip title={!canGenerate ? disabledReason : '根据大纲和前置章节内容创作'}>
-                    <Button
-                      type="primary"
-                      icon={canGenerate ? <ThunderboltOutlined /> : <LockOutlined />}
-                      onClick={() => currentChapter && showGenerateModal(currentChapter)}
-                      loading={isContinuing}
-                      disabled={!canGenerate}
-                      danger={!canGenerate}
-                      style={{ fontWeight: 'bold' }}
-                    >
-                      {isMobile ? 'AI' : 'AI创作'}
-                    </Button>
-                  </Tooltip>
+                  <Button
+                    type="primary"
+                    icon={canGenerate ? <ThunderboltOutlined /> : <LockOutlined />}
+                    onClick={() => currentChapter && showGenerateModal(currentChapter)}
+                    loading={isContinuing}
+                    disabled={!canGenerate}
+                    danger={!canGenerate}
+                    style={{ fontWeight: 'bold' }}
+                    title={!canGenerate ? disabledReason : '根据大纲和前置章节内容创作'}
+                  >
+                    {isMobile ? 'AI' : 'AI创作'}
+                  </Button>
                 );
               })()}
             </Space.Compact>
@@ -2548,6 +2591,19 @@ export default function Chapters() {
         groupedChapters={groupedChapters}
         onChapterSelect={handleChapterSelect}
       />
+
+      {/* 章节阅读器 */}
+      {readingChapter && (
+        <ChapterReader
+          visible={readerVisible}
+          chapter={readingChapter}
+          onClose={() => {
+            setReaderVisible(false);
+            setReadingChapter(null);
+          }}
+          onChapterChange={handleReaderChapterChange}
+        />
+      )}
 
       {/* 规划编辑器 */}
       {editingPlanChapter && currentProject && (() => {

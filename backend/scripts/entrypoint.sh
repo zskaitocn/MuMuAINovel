@@ -4,8 +4,28 @@
 
 set -e  # 遇到错误立即退出
 
+# 获取版本信息(从 .env.example 文件)
+# 如果环境变量未设置，则从 .env.example 读取
+if [ -z "$APP_VERSION" ]; then
+    if [ -f "/app/.env.example" ]; then
+        APP_VERSION=$(grep "^APP_VERSION=" /app/.env.example | cut -d '=' -f2)
+    fi
+    APP_VERSION="${APP_VERSION:-1.0.0}"
+fi
+
+if [ -z "$APP_NAME" ]; then
+    if [ -f "/app/.env.example" ]; then
+        APP_NAME=$(grep "^APP_NAME=" /app/.env.example | cut -d '=' -f2)
+    fi
+    APP_NAME="${APP_NAME:-MuMuAINovel}"
+fi
+
+BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+
 echo "================================================"
-echo "🚀 MuMuAINovel 启动中..."
+echo "🚀 ${APP_NAME} 启动中..."
+echo "📦 版本: v${APP_VERSION}"
+echo "🕐 启动时间: ${BUILD_TIME}"
 echo "================================================"
 
 # 数据库配置（从环境变量读取）
