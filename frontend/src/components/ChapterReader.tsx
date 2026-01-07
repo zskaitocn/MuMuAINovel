@@ -109,6 +109,19 @@ export default function ChapterReader({
   // 移动端检测
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 768);
 
+  // 1. 样式隔离：进入/退出阅读模式时切换 body class
+  useEffect(() => {
+    if (visible) {
+      document.body.classList.add('reading-mode-active');
+    } else {
+      document.body.classList.remove('reading-mode-active');
+    }
+    // 安全清理：组件卸载或异常时恢复
+    return () => {
+      document.body.classList.remove('reading-mode-active');
+    };
+  }, [visible]);
+
   // 响应式检测
   useEffect(() => {
     const handleResize = () => {
@@ -254,7 +267,8 @@ export default function ChapterReader({
         padding: isMobile ? '10px 12px' : '12px 20px',
         borderBottom: `1px solid ${currentTheme.border}`,
         background: currentTheme.headerBg,
-        zIndex: 10
+        zIndex: 10,
+        userSelect: 'none'
       }}>
         <Button 
           type="text" 
@@ -274,7 +288,8 @@ export default function ChapterReader({
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
-            fontSize: isMobile ? 14 : 16
+            fontSize: isMobile ? 14 : 16,
+            userSelect: 'text' // 允许选中复制标题
           }}
         >
           第{chapter.chapter_number}章：{chapter.title}
@@ -294,7 +309,8 @@ export default function ChapterReader({
         <div style={{
           padding: isMobile ? '12px 16px' : '16px 24px',
           borderBottom: `1px solid ${currentTheme.border}`,
-          background: currentTheme.headerBg
+          background: currentTheme.headerBg,
+          userSelect: 'none'
         }}>
           <Space 
             direction={isMobile ? 'vertical' : 'horizontal'} 
@@ -374,18 +390,22 @@ export default function ChapterReader({
               padding: isMobile ? '24px 16px 40px' : '40px 60px 40px',
               minHeight: '100%',
               fontSize: settings.fontSize,
-            lineHeight: settings.lineHeight,
-            color: currentTheme.text,
-            whiteSpace: 'pre-wrap',
-            textAlign: 'justify',
-            wordBreak: 'break-word',
-            overflowWrap: 'break-word'
-          }}
-        >
+              lineHeight: settings.lineHeight,
+              color: currentTheme.text,
+              textAlign: 'justify',
+              wordBreak: 'break-word',
+              overflowWrap: 'break-word',
+              userSelect: 'text'
+            }}
+          >
           {chapter.content ? (
-            // 按段落渲染内容，优化阅读体验
-            chapter.content.split('\n').map((paragraph, index) => (
-              paragraph.trim() ? (
+            // 按段落渲染内容：用样式制造段间距，避免用 <br/> 造成复制出现额外空行
+            chapter.content
+              .replace(/\r\n/g, '\n')
+              .split('\n')
+              .map((p) => p.trim())
+              .filter(Boolean)
+              .map((paragraph, index) => (
                 <p
                   key={index}
                   style={{
@@ -396,10 +416,7 @@ export default function ChapterReader({
                 >
                   {paragraph}
                 </p>
-              ) : (
-                <br key={index} />
-              )
-            ))
+              ))
           ) : (
             <div style={{ 
               textAlign: 'center', 
@@ -423,7 +440,8 @@ export default function ChapterReader({
         padding: isMobile ? '12px 16px' : '16px 24px',
         borderTop: `1px solid ${currentTheme.border}`,
         background: currentTheme.headerBg,
-        zIndex: 100
+        zIndex: 100,
+        userSelect: 'none'
       }}>
         <Button
           type="primary"

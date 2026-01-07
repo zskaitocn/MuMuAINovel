@@ -410,3 +410,11 @@ body {
   font-weight: 500;
   box-shadow: 0 4px 12px rgba(77, 128, 136, 0.3);
 }
+/* 沉浸式阅读模式样式隔离 */
+/* 当进入阅读模式时，禁止选中应用根节点的所有内容，解决Ctrl+A选中背景文字的问题 */
+body.reading-mode-active #root {
+  user-select: none;
+  -webkit-user-select: none; /* Safari/Chrome */
+  -moz-user-select: none;    /* Firefox */
+  -ms-user-select: none;     /* IE/Edge */
+}
