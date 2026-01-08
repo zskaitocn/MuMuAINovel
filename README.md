@@ -135,6 +135,8 @@ docker-compose up -d
 # 打开浏览器访问 http://localhost:8000
 ```
 
+> **💡 命令提示**：如果你的环境是 Docker Desktop / Compose v2，推荐使用 `docker compose up -d`（中间有空格）。本文中出现的 `docker-compose` 通常都可以等价替换为 `docker compose`。
+
 > **📌 注意事项**
 >
 > 1. **`.env` 文件挂载**: `docker-compose.yml` 会自动将 `.env` 挂载到容器，确保文件存在
@@ -143,11 +145,33 @@ docker-compose up -d
 
 ### 使用 Docker Hub 镜像（推荐新手）
 
+这一套步骤在 **Windows / macOS / Linux 本质没有区别**：你需要在自己电脑上准备一个“工作文件夹”，把 `docker-compose.yml` 和 `.env` 放进去；Docker 负责在后台拉取镜像并启动容器。
+
+先把下面几个概念记住（非常关键）：
+
+- **容器**：应用运行的“临时环境”，删掉/重建都很常见。
+- **持久化数据**：你希望“重启/更新后仍然存在”的内容。
+  - `postgres_data`：数据库数据（Docker volume，会持久化保存）
+  - `./logs`：日志文件（挂载到你电脑的文件夹，会持久化保存）
+  - `./.env`：你的配置（在你电脑上编辑；同时会挂载进容器供程序读取）
+
+#### 1）在电脑上准备一个工作文件夹（重要）
+
+选择任意位置新建一个文件夹，例如 `mumuainovel-docker`，然后在这个文件夹内准备这些内容：
+
+- `docker-compose.yml`（下面有完整示例，直接复制）
+- `.env`（配置文件，你自己创建并填写）
+- `logs/`（日志目录，空文件夹即可）
+
+> 说明：你后续所有 `docker compose ...` 命令都建议在这个工作文件夹里执行。
+
+#### 2）拉取镜像
+
 ```bash
 # 1. 拉取最新镜像（已包含模型文件）
 docker pull mumujie/mumuainovel:latest
 
-# 2. 创建 docker-compose.yml（点击下方展开查看完整配置）
+# 2. 在工作文件夹里创建 docker-compose.yml（点击下方展开查看完整配置）
 ```
 
 <details>
@@ -284,19 +308,35 @@ networks:
 
 </details>
 
+> **关于 `init_postgres.sql`（小白必看）**
+>
+> 上面的 compose 里有一行挂载：`./backend/scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro`。
+>
+> 这表示：你电脑上的工作文件夹里，必须存在 `backend/scripts/init_postgres.sql` 这个文件。
+>
+> - 如果你是从 Git 克隆了仓库并在仓库根目录执行 compose：这个文件通常已经存在。
+> - 如果你只想“纯用镜像不克隆代码”：也可以在工作文件夹里手动创建 `backend/scripts/` 目录，并把仓库里的 `backend/scripts/init_postgres.sql` 下载/复制进去。
+>
+> 该脚本只在 **首次初始化数据库** 时起作用；后续更新镜像通常不需要重复处理。
+
 ```bash
-# 3. 启动服务
-docker-compose up -d
+# 3. 启动服务（在工作文件夹中执行）
+docker compose up -d
 
 # 4. 查看日志
-docker-compose logs -f
+docker compose logs -f
 
-# 5. 更新到最新版本
-docker-compose pull
-docker-compose up -d
+# 5. 更新到最新版本（常用于“卡在更新版本/要升级”的情况）
+docker compose pull
+docker compose up -d
 ```
 
-> **💡 提示**: Docker Hub 镜像已包含所有依赖和模型文件，无需额外下载
+> **💡 提示**
+>
+> - Docker Hub 镜像已包含所有依赖和模型文件，无需额外下载。
+> - 想保留数据：请优先用 `docker compose down` 停止服务，不要随意删除 `postgres_data` volume。
+>   - `docker compose down`：只停容器，数据还在。
+>   - `docker compose down -v`：会连数据库数据一起删掉（慎用）。
 
 ### 本地开发 / 从源码构建
 
@@ -424,6 +464,13 @@ OPENAI_BASE_URL=https://your-proxy-service.com/v1
 
 ### 常用命令
 
+#### `docker compose` 与 `docker-compose` 的区别
+
+- `docker compose`：Docker Compose v2（推荐）。它是 Docker CLI 的子命令（插件形式），通常随 Docker Desktop 一起安装与更新。
+- `docker-compose`：Docker Compose v1（历史/兼容）。它是独立可执行文件，很多旧教程仍在使用。
+
+两者用途基本一致：都读取 `docker-compose.yml`（以及 `.env`）来编排容器。若你的机器上两者都可用，建议优先使用 `docker compose`。
+
 ```bash
 # 启动服务
 docker-compose up -d
@@ -443,6 +490,31 @@ docker-compose restart
 # 查看资源使用
 docker stats
 ```
+
+#### Windows/部分环境：启动报 `exec /app/entrypoint.sh: no such file or directory`
+
+如果你是从源码构建镜像/容器，在 Windows 上可能会因为脚本被检出为 CRLF 换行，导致容器启动时报：
+
+```
+exec /app/entrypoint.sh: no such file or directory
+```
+
+这类报错常见原因是 `entrypoint.sh` 第一行 shebang 变成了 `#!/bin/bash^M`（`^M` 来自 CRLF），从而找不到解释器路径。
+
+**临时绕过（不改仓库代码）**：用覆盖 entrypoint 的方式启动一次性容器，在容器内把 `\r` 去掉后再执行脚本。
+
+```bash
+# 先停止旧容器
+docker compose down
+
+# 以“覆盖 entrypoint”的方式启动（会创建一个新的 mumuainovel 容器）
+docker compose run -d --service-ports --name mumuainovel --entrypoint /bin/sh mumuainovel \
+  -lc "sed -i 's/\r$//' /app/entrypoint.sh /app/scripts/entrypoint.sh; exec /app/entrypoint.sh"
+```
+
+> 如果你使用的是 `docker-compose` 命令，把上面的 `docker compose` 替换为 `docker-compose` 即可。
+
+该绕过只对当前容器生效；重新构建镜像/重新创建容器后可能会复现。长期修复建议通过 PR 将相关 `.sh` 文件统一为 LF 换行并加以约束（见下方“贡献”）。
 
 ### 数据持久化
 
