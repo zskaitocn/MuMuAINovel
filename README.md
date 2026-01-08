@@ -160,7 +160,7 @@ docker-compose up -d
 选择任意位置新建一个文件夹，例如 `mumuainovel-docker`，然后在这个文件夹内准备这些内容：
 
 - `docker-compose.yml`（下面有完整示例，直接复制）
-- `.env`（配置文件，你自己创建并填写）
+- `.env`（配置文件，参考backend\.env.example创建并填写。）
 - `logs/`（日志目录，空文件夹即可）
 
 > 说明：你后续所有 `docker compose ...` 命令都建议在这个工作文件夹里执行。
