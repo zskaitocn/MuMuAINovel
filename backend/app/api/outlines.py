@@ -36,7 +36,7 @@ from app.services.memory_service import memory_service
 from app.services.plot_expansion_service import PlotExpansionService
 from app.logger import get_logger
 from app.api.settings import get_user_ai_service
-from app.utils.sse_response import SSEResponse, create_sse_response
+from app.utils.sse_response import SSEResponse, create_sse_response, WizardProgressTracker
 
 router = APIRouter(prefix="/outlines", tags=["大纲管理"])
 logger = get_logger(__name__)
@@ -73,6 +73,48 @@ async def verify_project_access(project_id: str, user_id: str, db: AsyncSession)
         raise HTTPException(status_code=404, detail="项目不存在或无权访问")
     
     return project
+
+
+def _build_chapters_brief(outlines: List[Outline], max_recent: int = 20) -> str:
+    """构建章节概览字符串"""
+    target = outlines[-max_recent:] if len(outlines) > max_recent else outlines
+    return "\n".join([f"第{o.order_index}章《{o.title}》" for o in target])
+
+
+def _build_characters_info(characters: List[Character]) -> str:
+    """构建角色信息字符串"""
+    return "\n".join([
+        f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
+        f"{char.personality[:100] if char.personality else '暂无描述'}"
+        for char in characters
+    ])
+
+
+async def _get_existing_organizations(project_id: str, db: AsyncSession) -> List[dict]:
+    """获取项目现有组织列表"""
+    from app.models.relationship import Organization
+    
+    organizations_result = await db.execute(
+        select(Character, Organization)
+        .join(Organization, Character.id == Organization.character_id)
+        .where(
+            Character.project_id == project_id,
+            Character.is_organization == True
+        )
+    )
+    organizations_raw = organizations_result.all()
+    return [
+        {
+            "id": org.id,
+            "name": char.name,
+            "organization_type": char.organization_type,
+            "organization_purpose": char.organization_purpose,
+            "power_level": org.power_level,
+            "location": org.location,
+            "motto": org.motto
+        }
+        for char, org in organizations_raw
+    ]
 
 
 @router.post("", response_model=OutlineResponse, summary="创建大纲")
@@ -145,26 +187,8 @@ async def get_project_outlines(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """获取指定项目的所有大纲（路径参数版本）"""
-    # 验证用户权限
-    user_id = getattr(request.state, 'user_id', None)
-    await verify_project_access(project_id, user_id, db)
-    
-    # 获取总数
-    count_result = await db.execute(
-        select(func.count(Outline.id)).where(Outline.project_id == project_id)
-    )
-    total = count_result.scalar_one()
-    
-    # 获取大纲列表
-    result = await db.execute(
-        select(Outline)
-        .where(Outline.project_id == project_id)
-        .order_by(Outline.order_index)
-    )
-    outlines = result.scalars().all()
-    
-    return OutlineListResponse(total=total, items=outlines)
+    """获取指定项目的所有大纲（路径参数版本，兼容旧API）"""
+    return await get_outlines(project_id, request, db)
 
 
 @router.get("/{outline_id}", response_model=OutlineResponse, summary="获取大纲详情")
@@ -406,18 +430,7 @@ async def predict_characters(
         characters = characters_result.scalars().all()
         
         # 构建已有章节概览
-        all_chapters_brief = ""
-        if len(existing_outlines) > 20:
-            recent_20 = existing_outlines[-20:]
-            all_chapters_brief = "\n".join([
-                f"第{o.order_index}章《{o.title}》"
-                for o in recent_20
-            ])
-        else:
-            all_chapters_brief = "\n".join([
-                f"第{o.order_index}章《{o.title}》"
-                for o in existing_outlines
-            ])
+        all_chapters_brief = _build_chapters_brief(existing_outlines)
         
         # 调用自动角色服务进行预测
         from app.services.auto_character_service import get_auto_character_service
@@ -479,7 +492,6 @@ async def predict_organizations(
     
     用于组织确认机制的第一步：在生成大纲前预测组织需求
     """
-    from app.schemas.outline import OrganizationPredictionResponse, PredictedOrganization
     from app.models.relationship import Organization
     
     # 验证用户权限
@@ -510,40 +522,10 @@ async def predict_organizations(
         characters = characters_result.scalars().all()
         
         # 获取现有组织
-        organizations_result = await db.execute(
-            select(Character, Organization)
-            .join(Organization, Character.id == Organization.character_id)
-            .where(
-                Character.project_id == request_data.project_id,
-                Character.is_organization == True
-            )
-        )
-        organizations_raw = organizations_result.all()
-        existing_organizations = []
-        for char, org in organizations_raw:
-            existing_organizations.append({
-                "id": org.id,
-                "name": char.name,
-                "organization_type": char.organization_type,
-                "organization_purpose": char.organization_purpose,
-                "power_level": org.power_level,
-                "location": org.location,
-                "motto": org.motto
-            })
+        existing_organizations = await _get_existing_organizations(request_data.project_id, db)
         
         # 构建已有章节概览
-        all_chapters_brief = ""
-        if len(existing_outlines) > 20:
-            recent_20 = existing_outlines[-20:]
-            all_chapters_brief = "\n".join([
-                f"第{o.order_index}章《{o.title}》"
-                for o in recent_20
-            ])
-        else:
-            all_chapters_brief = "\n".join([
-                f"第{o.order_index}章《{o.title}》"
-                for o in existing_outlines
-            ])
+        all_chapters_brief = _build_chapters_brief(existing_outlines)
         
         # 调用自动组织服务进行预测
         from app.services.auto_organization_service import get_auto_organization_service
@@ -613,81 +595,14 @@ async def _generate_new_outline(
         select(Character).where(Character.project_id == project.id)
     )
     characters = characters_result.scalars().all()
-    characters_info = "\n".join([
-        f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-        f"{char.personality[:100] if char.personality else '暂无描述'}"
-        for char in characters
-    ])
+    characters_info = _build_characters_info(characters)
     
-    # 🔍 MCP工具增强：收集情节设计参考资料（优化版）
-    mcp_reference_materials = ""
-    if request.enable_mcp:
-        try:
-            # 1️⃣ 静默检查工具可用性（注意：新建大纲时user_id可能不可用）
-            from app.services.mcp_tool_service import mcp_tool_service
-            # 使用传入的user_id参数
-            
-            if user_id:
-                available_tools = await mcp_tool_service.get_user_enabled_tools(
-                    user_id=user_id,
-                    db_session=db
-                )
-                
-                # 2️⃣ 只在有工具时才调用
-                if available_tools:
-                    logger.info(f"🔍 检测到可用MCP工具，收集大纲设计参考资料...")
-                    
-                    # 构建资料收集查询
-                    planning_query = f"""你正在为小说《{project.title}》设计完整大纲。
-项目信息：
-- 主题：{request.theme or project.theme}
-- 类型：{request.genre or project.genre}
-- 章节数：{request.chapter_count}
-- 叙事视角：{request.narrative_perspective}
-- 目标字数：{request.target_words}
-
-世界观设定：
-- 时间背景：{project.world_time_period or '未设定'}
-- 地理位置：{project.world_location or '未设定'}
-- 氛围基调：{project.world_atmosphere or '未设定'}
-
-角色信息：
-{characters_info or '暂无角色'}
-
-请搜索：
-1. 该类型小说的经典情节结构和套路
-2. 适合该主题的冲突设计思路
-3. 符合世界观的情节元素和场景设计灵感
-
-请有针对性地查询1-2个最关键的问题。"""
-                    
-                    # 调用MCP增强的AI（非流式，限制1轮避免超时）
-                    planning_result = await user_ai_service.generate_text_with_mcp(
-                        prompt=planning_query,
-                        user_id=user_id,
-                        db_session=db,
-                        enable_mcp=True,
-                        max_tool_rounds=2,
-                        tool_choice="auto",
-                        provider=None,
-                        model=None
-                    )
-                    
-                    # 提取参考资料
-                    if planning_result.get("tool_calls_made", 0) > 0:
-                        mcp_reference_materials = planning_result.get("content", "")
-                        logger.info(f"✅ MCP工具收集参考资料：{len(mcp_reference_materials)} 字符")
-                    else:
-                        logger.info(f"ℹ️ MCP未使用工具，继续")
-                else:
-                    logger.debug(f"用户 {user_id} 未启用MCP工具，跳过MCP增强")
-            else:
-                logger.debug("无用户上下文，跳过MCP增强")
-        except Exception as e:
-            logger.warning(f"⚠️ MCP工具调用失败，降级为基础模式: {str(e)}")
-            mcp_reference_materials = ""
+    # 设置用户信息以启用MCP
+    if user_id:
+        user_ai_service.user_id = user_id
+        user_ai_service.db_session = db
     
-    # 使用完整提示词（插入MCP参考资料，支持自定义）
+    # 使用提示词模板
     template = await PromptService.get_template("OUTLINE_CREATE", user_id, db)
     prompt = PromptService.format_prompt(
         template,
@@ -703,7 +618,7 @@ async def _generate_new_outline(
         rules=project.world_rules or "未设定",
         characters_info=characters_info or "暂无角色信息",
         requirements=request.requirements or "",
-        mcp_references=mcp_reference_materials
+        mcp_references=""
     )
     
     # 调用AI流式生成大纲（带字数统计）
@@ -713,7 +628,8 @@ async def _generate_new_outline(
     async for chunk in user_ai_service.generate_text_stream(
         prompt=prompt,
         provider=request.provider,
-        model=request.model
+        model=request.model,
+        auto_mcp=request.enable_mcp
     ):
         chunk_count += 1
         accumulated_text += chunk
@@ -894,11 +810,7 @@ async def _continue_outline(
         select(Character).where(Character.project_id == project.id)
     )
     characters = characters_result.scalars().all()
-    characters_info = "\n".join([
-        f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-        f"{char.personality[:100] if char.personality else '暂无描述'}"
-        for char in characters
-    ])
+    characters_info = _build_characters_info(characters)
     
     # 情节阶段指导
     stage_instructions = {
@@ -978,11 +890,7 @@ async def _continue_outline(
                     logger.info(f"ℹ️ 【确认模式】所有角色均已存在，无需创建")
                 
                 # 更新角色信息（供后续大纲生成使用）
-                characters_info = "\n".join([
-                    f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                    f"{char.personality[:100] if char.personality else '暂无描述'}"
-                    for char in characters
-                ])
+                characters_info = _build_characters_info(characters)
                 
             except Exception as e:
                 logger.error(f"⚠️ 【确认模式】创建确认角色失败: {e}", exc_info=True)
@@ -992,18 +900,7 @@ async def _continue_outline(
                 from app.services.auto_character_service import get_auto_character_service
                 
                 # 构建已有章节概览
-                all_chapters_brief_for_analysis = ""
-                if len(existing_outlines) > 20:
-                    recent_20 = existing_outlines[-20:]
-                    all_chapters_brief_for_analysis = "\n".join([
-                        f"第{o.order_index}章《{o.title}》"
-                        for o in recent_20
-                    ])
-                else:
-                    all_chapters_brief_for_analysis = "\n".join([
-                        f"第{o.order_index}章《{o.title}》"
-                        for o in existing_outlines
-                    ])
+                all_chapters_brief_for_analysis = _build_chapters_brief(existing_outlines)
                 
                 auto_char_service = get_auto_character_service(user_ai_service)
                 
@@ -1075,11 +972,7 @@ async def _continue_outline(
                         
                         # 更新角色信息（供后续大纲生成使用）
                         characters.extend(auto_result["new_characters"])
-                        characters_info = "\n".join([
-                            f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                            f"{char.personality[:100] if char.personality else '暂无描述'}"
-                            for char in characters
-                        ])
+                        characters_info = _build_characters_info(characters)
                     else:
                         logger.info(f"✅ 【直接创建模式】AI判断无需引入新角色，继续生成大纲")
                     
@@ -1091,29 +984,8 @@ async def _continue_outline(
     
     # 🏛️ 【组织引入】在生成大纲前预测并创建组织
     if request.enable_auto_organizations:
-        from app.models.relationship import Organization
-        
         # 获取现有组织
-        organizations_result = await db.execute(
-            select(Character, Organization)
-            .join(Organization, Character.id == Organization.character_id)
-            .where(
-                Character.project_id == project.id,
-                Character.is_organization == True
-            )
-        )
-        organizations_raw = organizations_result.all()
-        existing_organizations = []
-        for char, org in organizations_raw:
-            existing_organizations.append({
-                "id": org.id,
-                "name": char.name,
-                "organization_type": char.organization_type,
-                "organization_purpose": char.organization_purpose,
-                "power_level": org.power_level,
-                "location": org.location,
-                "motto": org.motto
-            })
+        existing_organizations = await _get_existing_organizations(project.id, db)
         
         # 检查是否有用户确认的组织列表
         if request.confirmed_organizations:
@@ -1177,11 +1049,7 @@ async def _continue_outline(
                 await db.commit()
                 
                 # 更新角色信息（供后续大纲生成使用）
-                characters_info = "\n".join([
-                    f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                    f"{char.personality[:100] if char.personality else '暂无描述'}"
-                    for char in characters
-                ])
+                characters_info = _build_characters_info(characters)
                 
                 logger.info(f"✅ 【确认模式】成功创建 {len(request.confirmed_organizations)} 个用户确认的组织")
                 
@@ -1193,18 +1061,7 @@ async def _continue_outline(
                 from app.services.auto_organization_service import get_auto_organization_service
                 
                 # 构建已有章节概览
-                all_chapters_brief_for_org_analysis = ""
-                if len(existing_outlines) > 20:
-                    recent_20 = existing_outlines[-20:]
-                    all_chapters_brief_for_org_analysis = "\n".join([
-                        f"第{o.order_index}章《{o.title}》"
-                        for o in recent_20
-                    ])
-                else:
-                    all_chapters_brief_for_org_analysis = "\n".join([
-                        f"第{o.order_index}章《{o.title}》"
-                        for o in existing_outlines
-                    ])
+                all_chapters_brief_for_org_analysis = _build_chapters_brief(existing_outlines)
                 
                 auto_org_service = get_auto_organization_service(user_ai_service)
                 
@@ -1281,11 +1138,7 @@ async def _continue_outline(
                             org_char = org_item.get("character")
                             if org_char:
                                 characters.append(org_char)
-                        characters_info = "\n".join([
-                            f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                            f"{char.personality[:100] if char.personality else '暂无描述'}"
-                            for char in characters
-                        ])
+                        characters_info = _build_characters_info(characters)
                     else:
                         logger.info(f"✅ 【直接创建模式】AI判断无需引入新组织，继续生成大纲")
                     
@@ -1355,66 +1208,10 @@ async def _continue_outline(
             logger.warning(f"⚠️ 记忆上下文构建失败，继续不使用记忆: {str(e)}")
             memory_context = None
         
-        # 🔍 MCP工具增强：收集续写参考资料（优化版）
-        mcp_reference_materials = ""
-        if request.enable_mcp:
-            try:
-                # 1️⃣ 静默检查工具可用性
-                from app.services.mcp_tool_service import mcp_tool_service
-                available_tools = await mcp_tool_service.get_user_enabled_tools(
-                    user_id=user_id,
-                    db_session=db
-                )
-                
-                # 2️⃣ 只在有工具时才调用
-                if available_tools:
-                    logger.info(f"🔍 第{batch_num + 1}批：检测到可用MCP工具，收集续写参考资料...")
-                    
-                    # 构建资料收集查询
-                    latest_summary = latest_outlines[-1].content if latest_outlines else ""
-                    planning_query = f"""你正在为小说《{project.title}》续写大纲。
-当前进度：已有{len(latest_outlines)}章，即将续写第{current_start_chapter}-{current_start_chapter + current_batch_size - 1}章
-
-项目信息：
-- 主题：{request.theme or project.theme}
-- 类型：{request.genre or project.genre}
-- 叙事视角：{request.narrative_perspective}
-- 情节阶段：{request.plot_stage}
-- 故事发展方向：{request.story_direction or '自然延续'}
-
-最近章节概要：
-{latest_summary[:200]}
-
-请搜索：
-1. 该情节阶段的经典处理手法和技巧
-2. 适合该发展方向的情节转折和冲突设计
-3. 符合类型特点的场景设计和剧情元素
-
-请有针对性地查询1-2个最关键的问题。"""
-                    
-                    # 调用MCP增强的AI（非流式，限制1轮避免超时）
-                    planning_result = await user_ai_service.generate_text_with_mcp(
-                        prompt=planning_query,
-                        user_id=user_id,
-                        db_session=db,
-                        enable_mcp=True,
-                        max_tool_rounds=2,  # ✅ 减少为1轮，避免超时
-                        tool_choice="auto",
-                        provider=None,
-                        model=None
-                    )
-                    
-                    # 提取参考资料
-                    if planning_result.get("tool_calls_made", 0) > 0:
-                        mcp_reference_materials = planning_result.get("content", "")
-                        logger.info(f"✅ 第{batch_num + 1}批MCP工具收集参考资料：{len(mcp_reference_materials)} 字符")
-                    else:
-                        logger.info(f"ℹ️ 第{batch_num + 1}批MCP未使用工具，继续")
-                else:
-                    logger.debug(f"用户 {user_id} 未启用MCP工具，跳过第{batch_num + 1}批MCP增强")
-            except Exception as e:
-                logger.warning(f"⚠️ 第{batch_num + 1}批MCP工具调用失败，降级为基础模式: {str(e)}")
-                mcp_reference_materials = ""
+        # 设置用户信息以启用MCP
+        if user_id:
+            user_ai_service.user_id = user_id
+            user_ai_service.db_session = db
         
         # 使用标准续写提示词模板（支持记忆+MCP增强+自定义）
         template = await PromptService.get_template("OUTLINE_CONTINUE", user_id, db)
@@ -1439,7 +1236,7 @@ async def _continue_outline(
             story_direction=request.story_direction or "自然延续",
             requirements=request.requirements or "",
             memory_context=memory_context,
-            mcp_references=mcp_reference_materials
+            mcp_references=""
         )
         
         # 调用AI生成当前批次（带重试机制）
@@ -1686,8 +1483,11 @@ async def new_outline_generator(
 ) -> AsyncGenerator[str, None]:
     """全新生成大纲SSE生成器（MCP增强版）"""
     db_committed = False
+    # 初始化标准进度追踪器
+    tracker = WizardProgressTracker("大纲")
+    
     try:
-        yield await SSEResponse.send_progress("开始生成大纲...", 5)
+        yield await tracker.start()
         
         project_id = data.get("project_id")
         # 确保chapter_count是整数（前端可能传字符串）
@@ -1695,102 +1495,32 @@ async def new_outline_generator(
         enable_mcp = data.get("enable_mcp", True)
         
         # 验证项目
-        yield await SSEResponse.send_progress("加载项目信息...", 10)
+        yield await tracker.loading("加载项目信息...", 0.3)
         result = await db.execute(
             select(Project).where(Project.id == project_id)
         )
         project = result.scalar_one_or_none()
         if not project:
-            yield await SSEResponse.send_error("项目不存在", 404)
+            yield await tracker.error("项目不存在", 404)
             return
         
-        yield await SSEResponse.send_progress(f"准备生成{chapter_count}章大纲...", 15)
+        yield await tracker.loading(f"准备生成{chapter_count}章大纲...", 0.6)
         
         # 获取角色信息
         characters_result = await db.execute(
             select(Character).where(Character.project_id == project_id)
         )
         characters = characters_result.scalars().all()
-        characters_info = "\n".join([
-            f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-            f"{char.personality[:100] if char.personality else '暂无描述'}"
-            for char in characters
-        ])
+        characters_info = _build_characters_info(characters)
         
-        # 🔍 MCP工具增强：收集情节设计参考资料（优化版）
-        mcp_reference_materials = ""
-        if enable_mcp:
-            try:
-                # 1️⃣ 静默检查工具可用性
-                from app.services.mcp_tool_service import mcp_tool_service
-                # 尝试从环境获取user_id（SSE流式场景下可能没有）
-                # 这里可以考虑让前端传递user_id
-                user_id_for_mcp = data.get("user_id")  # 需要前端传递
-                
-                if user_id_for_mcp:
-                    available_tools = await mcp_tool_service.get_user_enabled_tools(
-                        user_id=user_id_for_mcp,
-                        db_session=db
-                    )
-                    
-                    # 2️⃣ 只在有工具时才显示消息和调用
-                    if available_tools:
-                        yield await SSEResponse.send_progress("🔍 使用MCP工具收集参考资料...", 18)
-                        logger.info(f"🔍 检测到可用MCP工具，收集大纲设计参考资料...")
-                        
-                        # 构建资料收集查询
-                        planning_query = f"""你正在为小说《{project.title}》设计完整大纲。
-项目信息：
-- 主题：{data.get('theme') or project.theme}
-- 类型：{data.get('genre') or project.genre}
-- 章节数：{chapter_count}
-- 叙事视角：{data.get('narrative_perspective') or '第三人称'}
-- 目标字数：{data.get('target_words') or project.target_words or 100000}
-
-世界观设定：
-- 时间背景：{project.world_time_period or '未设定'}
-- 地理位置：{project.world_location or '未设定'}
-- 氛围基调：{project.world_atmosphere or '未设定'}
-
-角色信息：
-{characters_info or '暂无角色'}
-
-请搜索：
-1. 该类型小说的经典情节结构和套路
-2. 适合该主题的冲突设计思路
-3. 符合世界观的情节元素和场景设计灵感
-
-请有针对性地查询1-2个最关键的问题。"""
-                        
-                        # 调用MCP增强的AI（非流式，限制1轮避免超时）
-                        planning_result = await user_ai_service.generate_text_with_mcp(
-                            prompt=planning_query,
-                            user_id=user_id_for_mcp,
-                            db_session=db,
-                            enable_mcp=True,
-                            max_tool_rounds=2,  # ✅ 减少为1轮，避免超时
-                            tool_choice="auto",
-                            provider=None,
-                            model=None
-                        )
-                        
-                        # 提取参考资料
-                        if planning_result.get("tool_calls_made", 0) > 0:
-                            mcp_reference_materials = planning_result.get("content", "")
-                            logger.info(f"✅ MCP工具收集参考资料：{len(mcp_reference_materials)} 字符")
-                            yield await SSEResponse.send_progress(f"✅ MCP收集到参考资料 ({len(mcp_reference_materials)}字符)", 19)
-                        else:
-                            logger.info(f"ℹ️ MCP未使用工具，继续")
-                    else:
-                        logger.debug(f"用户 {user_id_for_mcp} 未启用MCP工具，跳过MCP增强")
-                else:
-                    logger.debug("无用户上下文，跳过MCP增强")
-            except Exception as e:
-                logger.warning(f"⚠️ MCP工具调用失败，降级为基础模式: {str(e)}")
-                mcp_reference_materials = ""
+        # 设置用户信息以启用MCP
+        user_id_for_mcp = data.get("user_id")
+        if user_id_for_mcp:
+            user_ai_service.user_id = user_id_for_mcp
+            user_ai_service.db_session = db
         
-        # 使用完整提示词（插入MCP参考资料，支持自定义）
-        yield await SSEResponse.send_progress("准备AI提示词...", 20)
+        # 使用提示词模板
+        yield await tracker.preparing("准备AI提示词...")
         template = await PromptService.get_template("OUTLINE_CREATE", user_id_for_mcp, db)
         prompt = PromptService.format_prompt(
             template,
@@ -1806,11 +1536,8 @@ async def new_outline_generator(
             rules=project.world_rules or "未设定",
             characters_info=characters_info or "暂无角色信息",
             requirements=data.get("requirements") or "",
-            mcp_references=mcp_reference_materials
+            mcp_references=""
         )
-        
-        # 调用AI流式生成
-        yield await SSEResponse.send_progress("🤖 正在调用AI生成...", 30)
         
         # 添加调试日志
         model_param = data.get("model")
@@ -1820,8 +1547,11 @@ async def new_outline_generator(
         logger.info(f"  model参数: {model_param}")
         
         # ✅ 流式生成（带字数统计和进度）
+        estimated_total = chapter_count * 1000
         accumulated_text = ""
         chunk_count = 0
+        
+        yield await tracker.generating(current_chars=0, estimated_total=estimated_total)
         
         async for chunk in user_ai_service.generate_text_stream(
             prompt=prompt,
@@ -1832,21 +1562,20 @@ async def new_outline_generator(
             accumulated_text += chunk
             
             # 发送内容块
-            yield await SSEResponse.send_chunk(chunk)
+            yield await tracker.generating_chunk(chunk)
             
-            # 定期更新进度和字数（30-95%，AI生成占65%）
-            if chunk_count % 5 == 0:
-                progress = min(30 + (chunk_count // 2), 95)
-                yield await SSEResponse.send_progress(
-                    f"AI生成大纲中... ({len(accumulated_text)}字符)",
-                    progress
+            # 定期更新进度
+            if chunk_count % 10 == 0:
+                yield await tracker.generating(
+                    current_chars=len(accumulated_text),
+                    estimated_total=estimated_total
                 )
             
             # 每20个块发送心跳
             if chunk_count % 20 == 0:
-                yield await SSEResponse.send_heartbeat()
+                yield await tracker.heartbeat()
         
-        yield await SSEResponse.send_progress("✅ AI生成完成，正在解析...", 96)
+        yield await tracker.parsing("解析大纲数据...")
         
         ai_content = accumulated_text
         ai_response = {"content": ai_content}
@@ -1867,18 +1596,15 @@ async def new_outline_generator(
                 if retry_count > max_retries:
                     # 超过最大重试次数，使用fallback数据
                     logger.error(f"❌ 大纲解析失败，已达最大重试次数({max_retries})，使用fallback数据")
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 解析失败，使用备用数据",
-                        96.5
-                    )
+                    yield await tracker.warning("解析失败，使用备用数据")
                     outline_data = _parse_ai_response(ai_content, raise_on_error=False)
                     break
                 
                 logger.warning(f"⚠️ JSON解析失败（第{retry_count}次），正在重试...")
-                yield await SSEResponse.send_progress(
-                    f"⚠️ 解析失败，正在重试({retry_count}/{max_retries})...",
-                    96
-                )
+                yield await tracker.retry(retry_count, max_retries, "JSON解析失败")
+                
+                # 重试时重置生成进度
+                tracker.reset_generating_progress()
                 
                 # 重新调用AI生成
                 accumulated_text = ""
@@ -1896,18 +1622,18 @@ async def new_outline_generator(
                     accumulated_text += chunk
                     
                     # 发送内容块
-                    yield await SSEResponse.send_chunk(chunk)
+                    yield await tracker.generating_chunk(chunk)
                     
                     # 每20个块发送心跳
                     if chunk_count % 20 == 0:
-                        yield await SSEResponse.send_heartbeat()
+                        yield await tracker.heartbeat()
                 
                 ai_content = accumulated_text
                 ai_response = {"content": ai_content}
                 logger.info(f"🔄 重试生成完成，累计{len(ai_content)}字符")
         
         # 全新生成模式：删除旧大纲和关联的所有章节
-        yield await SSEResponse.send_progress("清理旧大纲和章节...", 97)
+        yield await tracker.saving("清理旧大纲和章节...", 0.2)
         logger.info(f"全新生成：删除项目 {project_id} 的旧大纲和章节（outline_mode: {project.outline_mode}）")
         
         from sqlalchemy import delete as sql_delete
@@ -1939,7 +1665,7 @@ async def new_outline_generator(
         logger.info(f"✅ 全新生成：删除了 {deleted_outlines_count} 个旧大纲")
         
         # 保存新大纲
-        yield await SSEResponse.send_progress("💾 保存大纲到数据库...", 98)
+        yield await tracker.saving("保存大纲到数据库...", 0.6)
         outlines = await _save_outlines(
             project_id, outline_data, db, start_index=1
         )
@@ -1959,12 +1685,12 @@ async def new_outline_generator(
         for outline in outlines:
             await db.refresh(outline)
         
-        yield await SSEResponse.send_progress("整理结果数据...", 99)
-        
         logger.info(f"全新生成完成 - {len(outlines)} 章")
         
+        yield await tracker.complete()
+        
         # 发送最终结果
-        yield await SSEResponse.send_result({
+        yield await tracker.result({
             "message": f"成功生成{len(outlines)}章大纲",
             "total_chapters": len(outlines),
             "outlines": [
@@ -1981,8 +1707,7 @@ async def new_outline_generator(
             ]
         })
         
-        yield await SSEResponse.send_progress("🎉 生成完成!", 100, "success")
-        yield await SSEResponse.send_done()
+        yield await tracker.done()
         
     except GeneratorExit:
         logger.warning("大纲生成器被提前关闭")
@@ -1994,7 +1719,7 @@ async def new_outline_generator(
         if not db_committed and db.in_transaction():
             await db.rollback()
             logger.info("大纲生成事务已回滚（异常）")
-        yield await SSEResponse.send_error(f"生成失败: {str(e)}")
+        yield await tracker.error(f"生成失败: {str(e)}")
 
 
 async def continue_outline_generator(
@@ -2005,26 +1730,29 @@ async def continue_outline_generator(
 ) -> AsyncGenerator[str, None]:
     """大纲续写SSE生成器 - 分批生成，推送进度（记忆+MCP增强版）"""
     db_committed = False
+    # 初始化标准进度追踪器
+    tracker = WizardProgressTracker("大纲续写")
+    
     try:
-        # === 初始化阶段 5-10% ===
-        yield await SSEResponse.send_progress("开始续写大纲...", 5)
+        # === 初始化阶段 ===
+        yield await tracker.start("开始续写大纲...")
         
         project_id = data.get("project_id")
         # 确保chapter_count是整数（前端可能传字符串）
         total_chapters_to_generate = int(data.get("chapter_count", 5))
         
         # 验证项目
-        yield await SSEResponse.send_progress("加载项目信息...", 6)
+        yield await tracker.loading("加载项目信息...", 0.2)
         result = await db.execute(
             select(Project).where(Project.id == project_id)
         )
         project = result.scalar_one_or_none()
         if not project:
-            yield await SSEResponse.send_error("项目不存在", 404)
+            yield await tracker.error("项目不存在", 404)
             return
         
         # 获取现有大纲
-        yield await SSEResponse.send_progress("分析已有大纲...", 8)
+        yield await tracker.loading("分析已有大纲...", 0.5)
         existing_result = await db.execute(
             select(Outline)
             .where(Outline.project_id == project_id)
@@ -2033,15 +1761,15 @@ async def continue_outline_generator(
         existing_outlines = existing_result.scalars().all()
         
         if not existing_outlines:
-            yield await SSEResponse.send_error("续写模式需要已有大纲，当前项目没有大纲", 400)
+            yield await tracker.error("续写模式需要已有大纲，当前项目没有大纲", 400)
             return
         
         current_chapter_count = len(existing_outlines)
         last_chapter_number = existing_outlines[-1].order_index
         
-        yield await SSEResponse.send_progress(
+        yield await tracker.loading(
             f"当前已有{str(current_chapter_count)}章，将续写{str(total_chapters_to_generate)}章",
-            10
+            0.8
         )
         
         # 获取角色信息
@@ -2049,11 +1777,7 @@ async def continue_outline_generator(
             select(Character).where(Character.project_id == project_id)
         )
         characters = characters_result.scalars().all()
-        characters_info = "\n".join([
-            f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-            f"{char.personality[:100] if char.personality else '暂无描述'}"
-            for char in characters
-        ])
+        characters_info = _build_characters_info(characters)
 
         # 分批配置
         batch_size = 5
@@ -2072,16 +1796,15 @@ async def continue_outline_generator(
         confirmed_characters = data.get("confirmed_characters")
         confirmed_organizations = data.get("confirmed_organizations")
         
-        # === 角色引入阶段 10-20% ===
+        # === 角色引入阶段 ===
         # 🔧 判断：如果confirmed_organizations存在，说明已经是组织确认阶段，跳过角色处理
         if enable_auto_characters and not confirmed_organizations:
             # 检查是否有用户确认的角色列表
             if confirmed_characters:
                 # 直接使用用户确认的角色列表创建角色
                 try:
-                    yield await SSEResponse.send_progress(
-                        f"🎭 【确认模式】创建 {len(confirmed_characters)} 个用户确认的角色...",
-                        11
+                    yield await tracker.preparing(
+                        f"🎭 【确认模式】创建 {len(confirmed_characters)} 个用户确认的角色..."
                     )
                     
                     from app.services.auto_character_service import get_auto_character_service
@@ -2103,16 +1826,14 @@ async def continue_outline_generator(
                             char_name = char_data.get("name") or char_data.get("character_name")
                             if char_name in existing_character_names:
                                 logger.warning(f"⚠️ 角色 '{char_name}' 已存在，跳过创建")
-                                yield await SSEResponse.send_progress(
-                                    f"⏭️ [{idx+1}/{len(confirmed_characters)}] 角色 '{char_name}' 已存在，跳过",
-                                    char_progress
+                                yield await tracker.preparing(
+                                    f"⏭️ [{idx+1}/{len(confirmed_characters)}] 角色 '{char_name}' 已存在，跳过"
                                 )
                                 continue
                             
                             # 生成角色详细信息
-                            yield await SSEResponse.send_progress(
-                                f"🤖 [{idx+1}/{len(confirmed_characters)}] AI生成角色详情：{char_name}...",
-                                char_progress
+                            yield await tracker.preparing(
+                                f"🤖 [{idx+1}/{len(confirmed_characters)}] AI生成角色详情：{char_name}..."
                             )
                             character_data = await auto_char_service._generate_character_details(
                                 spec=char_data,
@@ -2124,9 +1845,8 @@ async def continue_outline_generator(
                             )
                             
                             # 创建角色记录
-                            yield await SSEResponse.send_progress(
-                                f"💾 [{idx+1}/{len(confirmed_characters)}] 保存角色：{char_name}...",
-                                char_progress + 1
+                            yield await tracker.preparing(
+                                f"💾 [{idx+1}/{len(confirmed_characters)}] 保存角色：{char_name}..."
                             )
                             character = await auto_char_service._create_character_record(
                                 project_id=project_id,
@@ -2137,9 +1857,8 @@ async def continue_outline_generator(
                             # 建立关系
                             relationships_data = character_data.get("relationships") or character_data.get("relationships_array", [])
                             if relationships_data:
-                                yield await SSEResponse.send_progress(
-                                    f"🔗 [{idx+1}/{len(confirmed_characters)}] 建立 {len(relationships_data)} 个关系：{char_name}...",
-                                    char_progress + 2
+                                yield await tracker.preparing(
+                                    f"🔗 [{idx+1}/{len(confirmed_characters)}] 建立 {len(relationships_data)} 个关系：{char_name}..."
                                 )
                                 await auto_char_service._create_relationships(
                                     new_character=character,
@@ -2153,40 +1872,33 @@ async def continue_outline_generator(
                             existing_character_names.add(character.name)  # 更新已存在的角色名称集合
                             actually_created_count += 1
                             logger.info(f"✅ 创建确认的角色: {character.name}")
-                            yield await SSEResponse.send_progress(
-                                f"✅ [{idx+1}/{len(confirmed_characters)}] 角色创建成功：{character.name}",
-                                char_progress + 3
+                            yield await tracker.preparing(
+                                f"✅ [{idx+1}/{len(confirmed_characters)}] 角色创建成功：{character.name}"
                             )
                             
                         except Exception as e:
                             logger.error(f"创建确认的角色失败: {e}", exc_info=True)
-                            yield await SSEResponse.send_progress(
-                                f"❌ [{idx+1}/{len(confirmed_characters)}] 角色创建失败：{char_name}",
-                                char_progress + 3
+                            yield await tracker.warning(
+                                f"[{idx+1}/{len(confirmed_characters)}] 角色创建失败：{char_name}"
                             )
                             continue
                     
                     # 提交角色到数据库
                     if actually_created_count > 0:
                         await db.commit()
-                        yield await SSEResponse.send_progress(
-                            f"✅ 【确认模式】实际创建了 {actually_created_count} 个新角色（跳过 {len(confirmed_characters) - actually_created_count} 个已存在）",
-                            20
+                        yield await tracker.preparing(
+                            f"✅ 【确认模式】实际创建了 {actually_created_count} 个新角色（跳过 {len(confirmed_characters) - actually_created_count} 个已存在）"
                         )
                         logger.info(f"✅ 【确认模式】实际创建了 {actually_created_count} 个新角色（跳过了 {len(confirmed_characters) - actually_created_count} 个已存在的角色）")
                     else:
-                        yield await SSEResponse.send_progress(
-                            f"ℹ️ 【确认模式】所有角色均已存在，无需创建",
-                            20
+                        yield await tracker.preparing(
+                            f"ℹ️ 【确认模式】所有角色均已存在，无需创建"
                         )
                         logger.info(f"ℹ️ 【确认模式】所有角色均已存在，无需创建")
                     
                 except Exception as e:
                     logger.error(f"⚠️ 【确认模式】创建确认角色失败: {e}", exc_info=True)
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 角色创建失败，继续生成大纲",
-                        20
-                    )
+                    yield await tracker.warning("角色创建失败，继续生成大纲")
             else:
                 # 根据 require_character_confirmation 决定处理方式
                 require_confirmation = data.get("require_character_confirmation", True)
@@ -2195,35 +1907,16 @@ async def continue_outline_generator(
                     from app.services.auto_character_service import get_auto_character_service
                     
                     # 构建已有章节概览
-                    all_chapters_brief_for_analysis = ""
-                    if len(existing_outlines) > 20:
-                        recent_20 = existing_outlines[-20:]
-                        all_chapters_brief_for_analysis = "\n".join([
-                            f"第{o.order_index}章《{o.title}》"
-                            for o in recent_20
-                        ])
-                    else:
-                        all_chapters_brief_for_analysis = "\n".join([
-                            f"第{o.order_index}章《{o.title}》"
-                            for o in existing_outlines
-                        ])
+                    all_chapters_brief_for_analysis = _build_chapters_brief(existing_outlines)
                     
                     auto_char_service = get_auto_character_service(user_ai_service)
                     
                     if require_confirmation:
                         # 🔮 预测模式：仅预测角色，不自动创建，需要用户确认
-                        yield await SSEResponse.send_progress(
-                            "🔮 【预测模式】AI分析角色需求...",
-                            11
-                        )
-                        
+                        yield await tracker.preparing("🔮 【预测模式】开始分析角色需求...")
                         logger.info(f"🔮 【预测模式】在生成大纲前预测是否需要新角色")
                         
-                        yield await SSEResponse.send_progress(
-                            "🤖 【预测模式】AI智能预测新角色...",
-                            15
-                        )
-                        
+                        # 进度消息不使用回调，因为在async generator中无法嵌套yield
                         auto_result = await auto_char_service.analyze_and_create_characters(
                             project_id=project_id,
                             outline_content="",  # 预测模式不需要大纲内容
@@ -2238,6 +1931,8 @@ async def continue_outline_generator(
                             story_direction=data.get("story_direction", "自然延续"),
                             preview_only=True  # ✅ 仅预测不创建
                         )
+                        
+                        yield await tracker.preparing("✅ 【预测模式】角色需求分析完成")
                         
                         # 检查是否需要新角色
                         if auto_result.get("needs_new_characters") and auto_result.get("predicted_characters"):
@@ -2258,43 +1953,60 @@ async def continue_outline_generator(
                             )
                             return
                         else:
-                            yield await SSEResponse.send_progress(
-                                "✅ 【预测模式】无需引入新角色，继续生成大纲",
-                                20
-                            )
+                            yield await tracker.preparing("✅ 【预测模式】无需引入新角色，继续生成大纲")
                             logger.info(f"✅ 【预测模式】AI判断无需引入新角色")
                     else:
                         # 🚀 直接创建模式：预测后自动创建，无需用户确认
-                        yield await SSEResponse.send_progress(
-                            "🚀 【直接创建模式】检测并自动创建新角色（无需确认）...",
-                            13
-                        )
-                        
+                        yield await tracker.preparing("🚀 【直接创建模式】开始分析并创建角色...")
                         logger.info(f"🚀 【直接创建模式】在生成大纲前预测并直接创建新角色")
                         
-                        auto_result = await auto_char_service.analyze_and_create_characters(
-                            project_id=project_id,
-                            outline_content="",
-                            existing_characters=list(characters),
-                            db=db,
-                            user_id=user_id,
-                            enable_mcp=data.get("enable_mcp", True),
-                            all_chapters_brief=all_chapters_brief_for_analysis,
-                            start_chapter=last_chapter_number + 1,
-                            chapter_count=total_chapters_to_generate,
-                            plot_stage=data.get("plot_stage", "development"),
-                            story_direction=data.get("story_direction", "自然延续"),
-                            preview_only=False  # ✅ 直接创建角色
+                        # 使用队列桥接回调和generator
+                        import asyncio
+                        progress_queue = asyncio.Queue()
+                        
+                        async def char_progress_callback(message):
+                            await progress_queue.put(message)
+                        
+                        # 启动服务任务
+                        char_task = asyncio.create_task(
+                            auto_char_service.analyze_and_create_characters(
+                                project_id=project_id,
+                                outline_content="",
+                                existing_characters=list(characters),
+                                db=db,
+                                user_id=user_id,
+                                enable_mcp=data.get("enable_mcp", True),
+                                all_chapters_brief=all_chapters_brief_for_analysis,
+                                start_chapter=last_chapter_number + 1,
+                                chapter_count=total_chapters_to_generate,
+                                plot_stage=data.get("plot_stage", "development"),
+                                story_direction=data.get("story_direction", "自然延续"),
+                                preview_only=False,
+                                progress_callback=char_progress_callback
+                            )
                         )
+                        
+                        # 在等待任务完成的同时，消费队列中的进度消息
+                        char_progress_base = 14
+                        while not char_task.done():
+                            try:
+                                message = await asyncio.wait_for(progress_queue.get(), timeout=0.1)
+                                yield await tracker.preparing(message)
+                            except asyncio.TimeoutError:
+                                pass
+                        
+                        # 获取结果
+                        auto_result = await char_task
+                        
+                        yield await tracker.preparing("✅ 【直接创建模式】角色分析和创建完成")
                         
                         # 如果创建了新角色，更新角色列表
                         if auto_result.get("new_characters"):
                             new_count = len(auto_result["new_characters"])
                             logger.info(f"✅ 【直接创建模式】自动创建了 {new_count} 个新角色")
                             
-                            yield await SSEResponse.send_progress(
-                                f"✅ 【直接创建模式】自动创建了 {new_count} 个新角色",
-                                18
+                            yield await tracker.preparing(
+                                f"✅ 【直接创建模式】自动创建了 {new_count} 个新角色"
                             )
                             
                             # 提交角色到数据库
@@ -2302,64 +2014,32 @@ async def continue_outline_generator(
                             
                             # 更新角色信息（供后续大纲生成使用）
                             characters.extend(auto_result["new_characters"])
-                            characters_info = "\n".join([
-                                f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                                f"{char.personality[:100] if char.personality else '暂无描述'}"
-                                for char in characters
-                            ])
+                            characters_info = _build_characters_info(characters)
                         else:
-                            yield await SSEResponse.send_progress(
-                                "✅ 【直接创建模式】无需引入新角色，继续生成大纲",
-                                20
-                            )
+                            yield await tracker.preparing("✅ 【直接创建模式】无需引入新角色，继续生成大纲")
                             logger.info(f"✅ 【直接创建模式】AI判断无需引入新角色")
                         
                 except Exception as e:
                     logger.error(f"⚠️ 【方案A】预测性角色引入失败: {e}", exc_info=True)
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 角色预测失败，继续生成大纲",
-                        20
-                    )
+                    yield await tracker.warning("角色预测失败，继续生成大纲")
                     # 不阻断大纲生成流程
         
-        # === 组织引入阶段 20-30% ===
+        # === 组织引入阶段 ===
         # 🏛️ 【组织引入】在生成大纲前预测并创建组织
         enable_auto_organizations = data.get("enable_auto_organizations", True)
         # confirmed_organizations在上面已经获取了，这里注释掉避免重复
         # confirmed_organizations = data.get("confirmed_organizations")
         
         if enable_auto_organizations:
-            from app.models.relationship import Organization
-            
             # 获取现有组织
-            organizations_result = await db.execute(
-                select(Character, Organization)
-                .join(Organization, Character.id == Organization.character_id)
-                .where(
-                    Character.project_id == project_id,
-                    Character.is_organization == True
-                )
-            )
-            organizations_raw = organizations_result.all()
-            existing_organizations = []
-            for char, org in organizations_raw:
-                existing_organizations.append({
-                    "id": org.id,
-                    "name": char.name,
-                    "organization_type": char.organization_type,
-                    "organization_purpose": char.organization_purpose,
-                    "power_level": org.power_level,
-                    "location": org.location,
-                    "motto": org.motto
-                })
+            existing_organizations = await _get_existing_organizations(project_id, db)
             
             # 检查是否有用户确认的组织列表
             if confirmed_organizations:
                 # 直接使用用户确认的组织列表创建组织
                 try:
-                    yield await SSEResponse.send_progress(
-                        f"🏛️ 【确认模式】创建 {len(confirmed_organizations)} 个用户确认的组织...",
-                        20
+                    yield await tracker.preparing(
+                        f"🏛️ 【确认模式】创建 {len(confirmed_organizations)} 个用户确认的组织..."
                     )
                     
                     from app.services.auto_organization_service import get_auto_organization_service
@@ -2376,9 +2056,8 @@ async def continue_outline_generator(
                             org_progress = 21 + int((idx / max(len(confirmed_organizations), 1)) * 8)
                             
                             # 生成组织详细信息
-                            yield await SSEResponse.send_progress(
-                                f"🤖 [{idx+1}/{len(confirmed_organizations)}] AI生成组织详情：{org_name}...",
-                                org_progress
+                            yield await tracker.preparing(
+                                f"🤖 [{idx+1}/{len(confirmed_organizations)}] AI生成组织详情：{org_name}..."
                             )
                             organization_data = await auto_org_service._generate_organization_details(
                                 spec=org_data,
@@ -2391,9 +2070,8 @@ async def continue_outline_generator(
                             )
                             
                             # 创建组织记录
-                            yield await SSEResponse.send_progress(
-                                f"💾 [{idx+1}/{len(confirmed_organizations)}] 保存组织：{org_name}...",
-                                org_progress + 0.5
+                            yield await tracker.preparing(
+                                f"💾 [{idx+1}/{len(confirmed_organizations)}] 保存组织：{org_name}..."
                             )
                             org_character, organization = await auto_org_service._create_organization_record(
                                 project_id=project_id,
@@ -2404,9 +2082,8 @@ async def continue_outline_generator(
                             # 建立成员关系
                             members_data = organization_data.get("initial_members", [])
                             if members_data:
-                                yield await SSEResponse.send_progress(
-                                    f"🔗 [{idx+1}/{len(confirmed_organizations)}] 建立 {len(members_data)} 个成员关系：{org_name}...",
-                                    org_progress + 1
+                                yield await tracker.preparing(
+                                    f"🔗 [{idx+1}/{len(confirmed_organizations)}] 建立 {len(members_data)} 个成员关系：{org_name}..."
                                 )
                                 await auto_org_service._create_member_relationships(
                                     organization=organization,
@@ -2429,34 +2106,28 @@ async def continue_outline_generator(
                             })
                             created_org_count += 1
                             logger.info(f"✅ 创建确认的组织: {org_character.name}")
-                            yield await SSEResponse.send_progress(
-                                f"✅ [{idx+1}/{len(confirmed_organizations)}] 组织创建成功：{org_character.name}",
-                                org_progress + 1.5
+                            yield await tracker.preparing(
+                                f"✅ [{idx+1}/{len(confirmed_organizations)}] 组织创建成功：{org_character.name}"
                             )
                             
                         except Exception as e:
                             logger.error(f"创建确认的组织失败: {e}", exc_info=True)
-                            yield await SSEResponse.send_progress(
-                                f"❌ [{idx+1}/{len(confirmed_organizations)}] 组织创建失败：{org_name}",
-                                org_progress + 1.5
+                            yield await tracker.warning(
+                                f"[{idx+1}/{len(confirmed_organizations)}] 组织创建失败：{org_name}"
                             )
                             continue
                     
                     # 提交组织到数据库
                     await db.commit()
                     
-                    yield await SSEResponse.send_progress(
-                        f"✅ 【确认模式】成功创建 {created_org_count} 个组织",
-                        30
+                    yield await tracker.preparing(
+                        f"✅ 【确认模式】成功创建 {created_org_count} 个组织"
                     )
                     logger.info(f"✅ 【确认模式】成功创建 {created_org_count} 个用户确认的组织")
                     
                 except Exception as e:
                     logger.error(f"⚠️ 【确认模式】创建确认组织失败: {e}", exc_info=True)
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 组织创建失败，继续生成大纲",
-                        30
-                    )
+                    yield await tracker.warning("组织创建失败，继续生成大纲")
             else:
                 # 根据 require_organization_confirmation 决定处理方式
                 require_org_confirmation = data.get("require_organization_confirmation", True)
@@ -2465,34 +2136,14 @@ async def continue_outline_generator(
                     from app.services.auto_organization_service import get_auto_organization_service
                     
                     # 构建已有章节概览
-                    all_chapters_brief_for_org_analysis = ""
-                    if len(existing_outlines) > 20:
-                        recent_20 = existing_outlines[-20:]
-                        all_chapters_brief_for_org_analysis = "\n".join([
-                            f"第{o.order_index}章《{o.title}》"
-                            for o in recent_20
-                        ])
-                    else:
-                        all_chapters_brief_for_org_analysis = "\n".join([
-                            f"第{o.order_index}章《{o.title}》"
-                            for o in existing_outlines
-                        ])
+                    all_chapters_brief_for_org_analysis = _build_chapters_brief(existing_outlines)
 
                     auto_org_service = get_auto_organization_service(user_ai_service)
                     
                     if require_org_confirmation:
                         # 🔮 预测模式：仅预测组织，不自动创建，需要用户确认
-                        yield await SSEResponse.send_progress(
-                            "🔮 【预测模式】AI分析组织需求...",
-                            21
-                        )
-                        
+                        yield await tracker.preparing("🔮 【预测模式】开始分析组织需求...")
                         logger.info(f"🔮 【预测模式】在生成大纲前预测是否需要新组织")
-                        
-                        yield await SSEResponse.send_progress(
-                            "🤖 【预测模式】AI智能预测新组织...",
-                            22
-                        )
                         
                         auto_result = await auto_org_service.analyze_and_create_organizations(
                             project_id=project_id,
@@ -2509,6 +2160,8 @@ async def continue_outline_generator(
                             story_direction=data.get("story_direction", "自然延续"),
                             preview_only=True  # ✅ 仅预测不创建
                         )
+                        
+                        yield await tracker.preparing("✅ 【预测模式】组织需求分析完成")
                         
                         # 检查是否需要新组织
                         if auto_result.get("needs_new_organizations") and auto_result.get("predicted_organizations"):
@@ -2529,40 +2182,53 @@ async def continue_outline_generator(
                             )
                             return
                         else:
-                            yield await SSEResponse.send_progress(
-                                "✅ 【预测模式】无需引入新组织，继续生成大纲",
-                                30
-                            )
+                            yield await tracker.preparing("✅ 【预测模式】无需引入新组织，继续生成大纲")
                             logger.info(f"✅ 【预测模式】AI判断无需引入新组织")
                     else:
                         # 🚀 直接创建模式：预测后自动创建，无需用户确认
-                        yield await SSEResponse.send_progress(
-                            "🚀 【直接创建模式】AI分析组织需求...",
-                            23
-                        )
-                        
+                        yield await tracker.preparing("🚀 【直接创建模式】开始分析并创建组织...")
                         logger.info(f"🚀 【直接创建模式】在生成大纲前预测并直接创建新组织")
                         
-                        yield await SSEResponse.send_progress(
-                            "🤖 【直接创建模式】AI预测并生成组织详情...",
-                            25
+                        # 使用队列桥接回调和generator
+                        import asyncio
+                        org_progress_queue = asyncio.Queue()
+                        
+                        async def org_progress_callback(message):
+                            await org_progress_queue.put(message)
+                        
+                        # 启动服务任务
+                        org_task = asyncio.create_task(
+                            auto_org_service.analyze_and_create_organizations(
+                                project_id=project_id,
+                                outline_content="",
+                                existing_characters=list(characters),
+                                existing_organizations=existing_organizations,
+                                db=db,
+                                user_id=user_id,
+                                enable_mcp=data.get("enable_mcp", True),
+                                all_chapters_brief=all_chapters_brief_for_org_analysis,
+                                start_chapter=last_chapter_number + 1,
+                                chapter_count=total_chapters_to_generate,
+                                plot_stage=data.get("plot_stage", "development"),
+                                story_direction=data.get("story_direction", "自然延续"),
+                                preview_only=False,
+                                progress_callback=org_progress_callback
+                            )
                         )
                         
-                        auto_result = await auto_org_service.analyze_and_create_organizations(
-                            project_id=project_id,
-                            outline_content="",
-                            existing_characters=list(characters),
-                            existing_organizations=existing_organizations,
-                            db=db,
-                            user_id=user_id,
-                            enable_mcp=data.get("enable_mcp", True),
-                            all_chapters_brief=all_chapters_brief_for_org_analysis,
-                            start_chapter=last_chapter_number + 1,
-                            chapter_count=total_chapters_to_generate,
-                            plot_stage=data.get("plot_stage", "development"),
-                            story_direction=data.get("story_direction", "自然延续"),
-                            preview_only=False  # ✅ 直接创建组织
-                        )
+                        # 在等待任务完成的同时，消费队列中的进度消息
+                        org_progress_base = 24
+                        while not org_task.done():
+                            try:
+                                message = await asyncio.wait_for(org_progress_queue.get(), timeout=0.1)
+                                yield await tracker.preparing(message)
+                            except asyncio.TimeoutError:
+                                pass
+                        
+                        # 获取结果
+                        auto_result = await org_task
+                        
+                        yield await tracker.preparing("✅ 【直接创建模式】组织分析和创建完成")
                         
                         # 如果创建了新组织，更新角色列表
                         if auto_result.get("new_organizations"):
@@ -2574,9 +2240,8 @@ async def continue_outline_generator(
                                     new_org_names.append(org_char.name)
                             logger.info(f"✅ 【直接创建模式】自动创建了 {new_count} 个新组织")
                             
-                            yield await SSEResponse.send_progress(
-                                f"✅ 【直接创建模式】成功创建 {new_count} 个新组织：{', '.join(new_org_names[:3])}{'...' if new_count > 3 else ''}",
-                                30
+                            yield await tracker.preparing(
+                                f"✅ 【直接创建模式】成功创建 {new_count} 个新组织：{', '.join(new_org_names[:3])}{'...' if new_count > 3 else ''}"
                             )
                             
                             # 提交组织到数据库
@@ -2587,41 +2252,35 @@ async def continue_outline_generator(
                                 org_char = org_item.get("character")
                                 if org_char:
                                     characters.append(org_char)
-                            characters_info = "\n".join([
-                                f"- {char.name} ({'组织' if char.is_organization else '角色'}, {char.role_type}): "
-                                f"{char.personality[:100] if char.personality else '暂无描述'}"
-                                for char in characters
-                            ])
+                            characters_info = _build_characters_info(characters)
                         else:
-                            yield await SSEResponse.send_progress(
-                                "✅ 【直接创建模式】无需引入新组织，继续生成大纲",
-                                30
-                            )
+                            yield await tracker.preparing("✅ 【直接创建模式】无需引入新组织，继续生成大纲")
                             logger.info(f"✅ 【直接创建模式】AI判断无需引入新组织")
                         
                 except Exception as e:
                     logger.error(f"⚠️ 【组织引入】预测性组织引入失败: {e}", exc_info=True)
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 组织预测失败，继续生成大纲",
-                        30
-                    )
+                    yield await tracker.warning("组织预测失败，继续生成大纲")
                     # 不阻断大纲生成流程
         
-        # === 批次生成阶段 30-90% ===
+        # === 批次生成阶段 ===
         all_new_outlines = []
         current_start_chapter = last_chapter_number + 1
-
+        
         for batch_num in range(total_batches):
             # 计算当前批次的章节数
             remaining_chapters = int(total_chapters_to_generate) - len(all_new_outlines)
             current_batch_size = min(batch_size, remaining_chapters)
             
-            # 批次进度：30-90%，每批平均分配
-            batch_progress = 30 + (batch_num * 60 // total_batches)
+            # 每批使用的进度预估
+            estimated_chars_per_batch = current_batch_size * 1000
             
-            yield await SSEResponse.send_progress(
-                f"📝 第{str(batch_num + 1)}/{str(total_batches)}批: 生成第{str(current_start_chapter)}-{str(current_start_chapter + current_batch_size - 1)}章",
-                batch_progress
+            # 重置生成进度以便于每批独立计算
+            tracker.reset_generating_progress()
+            
+            yield await tracker.generating(
+                current_chars=0,
+                estimated_total=estimated_chars_per_batch,
+                message=f"📝 第{str(batch_num + 1)}/{str(total_batches)}批: 生成第{str(current_start_chapter)}-{str(current_start_chapter + current_batch_size - 1)}章"
             )
             
             # 获取最新的大纲列表（包括之前批次生成的）
@@ -2658,9 +2317,10 @@ async def continue_outline_generator(
             # 🧠 构建记忆增强上下文
             memory_context = None
             try:
-                yield await SSEResponse.send_progress(
-                    f"🧠 构建记忆上下文...",
-                    batch_progress + 3
+                yield await tracker.generating(
+                    current_chars=0,
+                    estimated_total=estimated_chars_per_batch,
+                    message="🧠 构建记忆上下文..."
                 )
                 query_outline = latest_outlines[-1].content if latest_outlines else ""
                 memory_context = await memory_service.build_context_for_generation(
@@ -2674,80 +2334,15 @@ async def continue_outline_generator(
             except Exception as e:
                 logger.warning(f"⚠️ 记忆上下文构建失败: {str(e)}")
                 memory_context = None
-            # 🔍 MCP工具增强：收集续写参考资料（优化版）
-            mcp_reference_materials = ""
-            enable_mcp = data.get("enable_mcp", True)
-            if enable_mcp:
-                try:
-                    # 1️⃣ 静默检查工具可用性
-                    from app.services.mcp_tool_service import mcp_tool_service
-                    available_tools = await mcp_tool_service.get_user_enabled_tools(
-                        user_id=user_id,
-                        db_session=db
-                    )
-                    
-                    # 2️⃣ 只在有工具时才显示消息和调用
-                    if available_tools:
-                        yield await SSEResponse.send_progress(
-                            f"🔍 第{str(batch_num + 1)}批：使用MCP工具收集参考资料...",
-                            batch_progress + 4
-                        )
-                        logger.info(f"🔍 第{batch_num + 1}批：检测到可用MCP工具，收集续写参考资料...")
-                        
-                        # 构建资料收集查询
-                        latest_summary = latest_outlines[-1].content if latest_outlines else ""
-                        planning_query = f"""你正在为小说《{project.title}》续写大纲。
-当前进度：已有{len(latest_outlines)}章，即将续写第{current_start_chapter}-{current_start_chapter + current_batch_size - 1}章
-
-项目信息：
-- 主题：{data.get('theme') or project.theme}
-- 类型：{data.get('genre') or project.genre}
-- 叙事视角：{data.get('narrative_perspective') or project.narrative_perspective or '第三人称'}
-- 情节阶段：{data.get('plot_stage', 'development')}
-- 故事发展方向：{data.get('story_direction', '自然延续')}
-
-最近章节概要：
-{latest_summary[:200]}
-
-请搜索：
-1. 该情节阶段的经典处理手法和技巧
-2. 适合该发展方向的情节转折和冲突设计
-3. 符合类型特点的场景设计和剧情元素
-
-请有针对性地查询1-2个最关键的问题。"""
-                        
-                        # 调用MCP增强的AI（非流式，限制1轮避免超时）
-                        planning_result = await user_ai_service.generate_text_with_mcp(
-                            prompt=planning_query,
-                            user_id=user_id,
-                            db_session=db,
-                            enable_mcp=True,
-                            max_tool_rounds=2,  # ✅ 减少为1轮，避免超时
-                            tool_choice="auto",
-                            provider=None,
-                            model=None
-                        )
-                        
-                        # 提取参考资料
-                        if planning_result.get("tool_calls_made", 0) > 0:
-                            mcp_reference_materials = planning_result.get("content", "")
-                            logger.info(f"✅ 第{batch_num + 1}批MCP工具收集参考资料：{len(mcp_reference_materials)} 字符")
-                            yield await SSEResponse.send_progress(
-                                f"✅ 第{str(batch_num + 1)}批收集到参考资料 ({len(mcp_reference_materials)}字符)",
-                                batch_progress + 4.5
-                            )
-                        else:
-                            logger.info(f"ℹ️ 第{batch_num + 1}批MCP未使用工具，继续")
-                    else:
-                        logger.debug(f"用户 {user_id} 未启用MCP工具，跳过第{batch_num + 1}批MCP增强")
-                except Exception as e:
-                    logger.warning(f"⚠️ 第{batch_num + 1}批MCP工具调用失败，降级为基础模式: {str(e)}")
-                    mcp_reference_materials = ""
+            # 设置用户信息以启用MCP
+            if user_id:
+                user_ai_service.user_id = user_id
+                user_ai_service.db_session = db
             
-            
-            yield await SSEResponse.send_progress(
-                f" 调用AI生成第{str(batch_num + 1)}批...",
-                batch_progress + 5
+            yield await tracker.generating(
+                current_chars=0,
+                estimated_total=estimated_chars_per_batch,
+                message=f"🤖 调用AI生成第{str(batch_num + 1)}批..."
             )
             
             # 使用标准续写提示词模板（支持记忆+MCP增强+自定义）
@@ -2773,7 +2368,7 @@ async def continue_outline_generator(
                 story_direction=data.get("story_direction", "自然延续"),
                 requirements=data.get("requirements", ""),
                 memory_context=memory_context,
-                mcp_references=mcp_reference_materials
+                mcp_references=""
             )
             
             # 调用AI生成当前批次
@@ -2796,26 +2391,21 @@ async def continue_outline_generator(
                 accumulated_text += chunk
                 
                 # 发送内容块
-                yield await SSEResponse.send_chunk(chunk)
+                yield await tracker.generating_chunk(chunk)
                 
-                # 定期更新进度（每批在分配范围内平滑递增）
-                if chunk_count % 5 == 0:
-                    # 在批次范围内平滑递增
-                    batch_range = 60 // total_batches  # 每批分配的进度范围
-                    progress_in_batch = batch_progress + min((chunk_count // 3), batch_range - 2)
-                    yield await SSEResponse.send_progress(
-                        f"📝 第{str(batch_num + 1)}/{str(total_batches)}批生成中... ({len(accumulated_text)}字符)",
-                        progress_in_batch
+                # 定期更新进度
+                if chunk_count % 10 == 0:
+                    yield await tracker.generating(
+                        current_chars=len(accumulated_text),
+                        estimated_total=estimated_chars_per_batch,
+                        message=f"📝 第{str(batch_num + 1)}/{str(total_batches)}批生成中"
                     )
                 
                 # 每20个块发送心跳
                 if chunk_count % 20 == 0:
-                    yield await SSEResponse.send_heartbeat()
+                    yield await tracker.heartbeat()
             
-            yield await SSEResponse.send_progress(
-                f"✅ 第{str(batch_num + 1)}批AI生成完成，正在解析...",
-                min(batch_progress + batch_range - 5, 88)
-            )
+            yield await tracker.parsing(f"✅ 第{str(batch_num + 1)}批AI生成完成，正在解析...")
             
             # 提取内容
             ai_content = accumulated_text
@@ -2837,18 +2427,15 @@ async def continue_outline_generator(
                     if retry_count > max_retries:
                         # 超过最大重试次数，使用fallback数据
                         logger.error(f"❌ 第{batch_num + 1}批解析失败，已达最大重试次数({max_retries})，使用fallback数据")
-                        yield await SSEResponse.send_progress(
-                            f"⚠️ 第{str(batch_num + 1)}批解析失败，使用备用数据",
-                            min(batch_progress + batch_range - 3, 89)
-                        )
+                        yield await tracker.warning(f"第{str(batch_num + 1)}批解析失败，使用备用数据")
                         outline_data = _parse_ai_response(ai_content, raise_on_error=False)
                         break
                     
                     logger.warning(f"⚠️ 第{batch_num + 1}批JSON解析失败（第{retry_count}次），正在重试...")
-                    yield await SSEResponse.send_progress(
-                        f"⚠️ 第{str(batch_num + 1)}批解析失败，正在重试({retry_count}/{max_retries})...",
-                        min(batch_progress + batch_range - 4, 88)
-                    )
+                    yield await tracker.retry(retry_count, max_retries, f"第{str(batch_num + 1)}批解析失败")
+                    
+                    # 重试时重置生成进度
+                    tracker.reset_generating_progress()
                     
                     # 重新调用AI生成
                     accumulated_text = ""
@@ -2866,11 +2453,11 @@ async def continue_outline_generator(
                         accumulated_text += chunk
                         
                         # 发送内容块
-                        yield await SSEResponse.send_chunk(chunk)
+                        yield await tracker.generating_chunk(chunk)
                         
                         # 每20个块发送心跳
                         if chunk_count % 20 == 0:
-                            yield await SSEResponse.send_heartbeat()
+                            yield await tracker.heartbeat()
                     
                     ai_content = accumulated_text
                     ai_response = {"content": ai_content}
@@ -2899,9 +2486,9 @@ async def continue_outline_generator(
             all_new_outlines.extend(batch_outlines)
             current_start_chapter += current_batch_size
             
-            yield await SSEResponse.send_progress(
+            yield await tracker.saving(
                 f"💾 第{str(batch_num + 1)}批保存成功！本批生成{str(len(batch_outlines))}章，累计新增{str(len(all_new_outlines))}章",
-                min(batch_progress + batch_range, 90)
+                (batch_num + 1) / total_batches
             )
             
             logger.info(f"第{str(batch_num + 1)}批生成完成，本批生成{str(len(batch_outlines))}章")
@@ -2916,11 +2503,10 @@ async def continue_outline_generator(
         )
         all_outlines = final_result.scalars().all()
         
-        # === 结果整理阶段 90-100% ===
-        yield await SSEResponse.send_progress("整理结果数据...", 92)
+        yield await tracker.complete()
         
         # 发送最终结果
-        yield await SSEResponse.send_result({
+        yield await tracker.result({
             "message": f"续写完成！共{str(total_batches)}批，新增{str(len(all_new_outlines))}章，总计{str(len(all_outlines))}章",
             "total_batches": total_batches,
             "new_chapters": len(all_new_outlines),
@@ -2939,8 +2525,7 @@ async def continue_outline_generator(
             ]
         })
         
-        yield await SSEResponse.send_progress("🎉 续写完成!", 100, "success")
-        yield await SSEResponse.send_done()
+        yield await tracker.done()
         
     except GeneratorExit:
         logger.warning("大纲续写生成器被提前关闭")
@@ -2952,7 +2537,7 @@ async def continue_outline_generator(
         if not db_committed and db.in_transaction():
             await db.rollback()
             logger.info("大纲续写事务已回滚（异常）")
-        yield await SSEResponse.send_error(f"续写失败: {str(e)}")
+        yield await tracker.error(f"续写失败: {str(e)}")
 
 
 @router.post("/generate-stream", summary="AI生成/续写大纲(SSE流式)")
@@ -3032,8 +2617,11 @@ async def expand_outline_generator(
 ) -> AsyncGenerator[str, None]:
     """单个大纲展开SSE生成器 - 实时推送进度（支持分批生成）"""
     db_committed = False
+    # 初始化标准进度追踪器
+    tracker = WizardProgressTracker("大纲展开")
+    
     try:
-        yield await SSEResponse.send_progress("开始展开大纲...", 5)
+        yield await tracker.start()
         
         target_chapter_count = int(data.get("target_chapter_count", 3))
         expansion_strategy = data.get("expansion_strategy", "balanced")
@@ -3042,50 +2630,46 @@ async def expand_outline_generator(
         batch_size = int(data.get("batch_size", 5))  # 支持自定义批次大小
         
         # 获取大纲
-        yield await SSEResponse.send_progress("加载大纲信息...", 10)
+        yield await tracker.loading("加载大纲信息...", 0.3)
         result = await db.execute(
             select(Outline).where(Outline.id == outline_id)
         )
         outline = result.scalar_one_or_none()
         
         if not outline:
-            yield await SSEResponse.send_error("大纲不存在", 404)
+            yield await tracker.error("大纲不存在", 404)
             return
         
         # 获取项目信息
-        yield await SSEResponse.send_progress("加载项目信息...", 15)
+        yield await tracker.loading("加载项目信息...", 0.7)
         project_result = await db.execute(
             select(Project).where(Project.id == outline.project_id)
         )
         project = project_result.scalar_one_or_none()
         if not project:
-            yield await SSEResponse.send_error("项目不存在", 404)
+            yield await tracker.error("项目不存在", 404)
             return
         
-        yield await SSEResponse.send_progress(
-            f"准备展开《{outline.title}》为 {target_chapter_count} 章...",
-            20
+        yield await tracker.preparing(
+            f"准备展开《{outline.title}》为 {target_chapter_count} 章..."
         )
         
         # 创建展开服务实例
         expansion_service = PlotExpansionService(user_ai_service)
         
-        # 定义进度回调函数
-        async def progress_callback(batch_num: int, total_batches: int, start_idx: int, batch_size: int):
-            progress = 30 + int((batch_num - 1) / total_batches * 40)
-            yield await SSEResponse.send_progress(
-                f"📝 生成第{batch_num}/{total_batches}批（第{start_idx}-{start_idx + batch_size - 1}节）...",
-                progress
-            )
-        
         # 分析大纲并生成章节规划（支持分批）
         if target_chapter_count > batch_size:
-            yield await SSEResponse.send_progress(
-                f"🤖 AI分批生成章节规划（每批{batch_size}章）...",
-                30
+            yield await tracker.generating(
+                current_chars=0,
+                estimated_total=target_chapter_count * 500,
+                message=f"🤖 AI分批生成章节规划（每批{batch_size}章）..."
             )
         else:
-            yield await SSEResponse.send_progress("🤖 AI分析大纲，生成章节规划...", 30)
+            yield await tracker.generating(
+                current_chars=0,
+                estimated_total=target_chapter_count * 500,
+                message="🤖 AI分析大纲，生成章节规划..."
+            )
         
         chapter_plans = await expansion_service.analyze_outline_for_chapters(
             outline=outline,
@@ -3101,18 +2685,17 @@ async def expand_outline_generator(
         )
         
         if not chapter_plans:
-            yield await SSEResponse.send_error("AI分析失败，未能生成章节规划", 500)
+            yield await tracker.error("AI分析失败，未能生成章节规划", 500)
             return
         
-        yield await SSEResponse.send_progress(
-            f"✅ 规划生成完成！共 {len(chapter_plans)} 个章节",
-            70
+        yield await tracker.parsing(
+            f"✅ 规划生成完成！共 {len(chapter_plans)} 个章节"
         )
         
         # 根据配置决定是否创建章节记录
         created_chapters = None
         if auto_create_chapters:
-            yield await SSEResponse.send_progress("💾 创建章节记录...", 80)
+            yield await tracker.saving("💾 创建章节记录...", 0.3)
             
             created_chapters = await expansion_service.create_chapters_from_plans(
                 outline_id=outline_id,
@@ -3129,12 +2712,12 @@ async def expand_outline_generator(
             for chapter in created_chapters:
                 await db.refresh(chapter)
             
-            yield await SSEResponse.send_progress(
+            yield await tracker.saving(
                 f"✅ 成功创建 {len(created_chapters)} 个章节记录",
-                90
+                0.8
             )
         
-        yield await SSEResponse.send_progress("整理结果数据...", 95)
+        yield await tracker.complete()
         
         # 构建响应数据
         result_data = {
@@ -3158,9 +2741,8 @@ async def expand_outline_generator(
             ] if created_chapters else None
         }
         
-        yield await SSEResponse.send_result(result_data)
-        yield await SSEResponse.send_progress("🎉 展开完成!", 100, "success")
-        yield await SSEResponse.send_done()
+        yield await tracker.result(result_data)
+        yield await tracker.done()
         
     except GeneratorExit:
         logger.warning("大纲展开生成器被提前关闭")
@@ -3172,7 +2754,7 @@ async def expand_outline_generator(
         if not db_committed and db.in_transaction():
             await db.rollback()
             logger.info("大纲展开事务已回滚（异常）")
-        yield await SSEResponse.send_error(f"展开失败: {str(e)}")
+        yield await tracker.error(f"展开失败: {str(e)}")
 
 
 @router.post("/{outline_id}/create-single-chapter", summary="一对一创建章节(传统模式)")
@@ -3407,8 +2989,11 @@ async def batch_expand_outlines_generator(
 ) -> AsyncGenerator[str, None]:
     """批量展开大纲SSE生成器 - 实时推送进度"""
     db_committed = False
+    # 初始化标准进度追踪器
+    tracker = WizardProgressTracker("批量大纲展开")
+    
     try:
-        yield await SSEResponse.send_progress("开始批量展开大纲...", 5)
+        yield await tracker.start()
         
         project_id = data.get("project_id")
         chapters_per_outline = int(data.get("chapters_per_outline", 3))
@@ -3417,17 +3002,17 @@ async def batch_expand_outlines_generator(
         outline_ids = data.get("outline_ids")
         
         # 获取项目信息
-        yield await SSEResponse.send_progress("加载项目信息...", 10)
+        yield await tracker.loading("加载项目信息...", 0.5)
         project_result = await db.execute(
             select(Project).where(Project.id == project_id)
         )
         project = project_result.scalar_one_or_none()
         if not project:
-            yield await SSEResponse.send_error("项目不存在", 404)
+            yield await tracker.error("项目不存在", 404)
             return
         
         # 获取要展开的大纲列表
-        yield await SSEResponse.send_progress("获取大纲列表...", 15)
+        yield await tracker.loading("获取大纲列表...", 0.8)
         if outline_ids:
             outlines_result = await db.execute(
                 select(Outline)
@@ -3447,13 +3032,12 @@ async def batch_expand_outlines_generator(
         outlines = outlines_result.scalars().all()
         
         if not outlines:
-            yield await SSEResponse.send_error("没有找到要展开的大纲", 404)
+            yield await tracker.error("没有找到要展开的大纲", 404)
             return
         
         total_outlines = len(outlines)
-        yield await SSEResponse.send_progress(
-            f"共找到 {total_outlines} 个大纲，开始批量展开...",
-            20
+        yield await tracker.preparing(
+            f"共找到 {total_outlines} 个大纲，开始批量展开..."
         )
         
         # 创建展开服务实例
@@ -3465,12 +3049,13 @@ async def batch_expand_outlines_generator(
         
         for idx, outline in enumerate(outlines):
             try:
-                # 计算当前进度 (20% - 90%)
-                progress = 20 + int((idx / total_outlines) * 70)
+                # 计算当前子进度 (0.0-1.0)，用于generating阶段
+                sub_progress = idx / max(total_outlines, 1)
                 
-                yield await SSEResponse.send_progress(
-                    f"📝 处理第 {idx + 1}/{total_outlines} 个大纲: {outline.title}",
-                    progress
+                yield await tracker.generating(
+                    current_chars=idx * chapters_per_outline * 500,
+                    estimated_total=total_outlines * chapters_per_outline * 500,
+                    message=f"📝 处理第 {idx + 1}/{total_outlines} 个大纲: {outline.title}"
                 )
                 
                 # 检查大纲是否已经展开过
@@ -3488,16 +3073,18 @@ async def batch_expand_outlines_generator(
                         "outline_title": outline.title,
                         "reason": "已展开"
                     })
-                    yield await SSEResponse.send_progress(
-                        f"⏭️ {outline.title} 已展开过，跳过",
-                        progress + 1
+                    yield await tracker.generating(
+                        current_chars=(idx + 1) * chapters_per_outline * 500,
+                        estimated_total=total_outlines * chapters_per_outline * 500,
+                        message=f"⏭️ {outline.title} 已展开过，跳过"
                     )
                     continue
                 
                 # 分析大纲生成章节规划
-                yield await SSEResponse.send_progress(
-                    f"🤖 AI分析大纲: {outline.title}",
-                    progress + 2
+                yield await tracker.generating(
+                    current_chars=idx * chapters_per_outline * 500,
+                    estimated_total=total_outlines * chapters_per_outline * 500,
+                    message=f"🤖 AI分析大纲: {outline.title}"
                 )
                 
                 chapter_plans = await expansion_service.analyze_outline_for_chapters(
@@ -3511,9 +3098,10 @@ async def batch_expand_outlines_generator(
                     model=data.get("model")
                 )
                 
-                yield await SSEResponse.send_progress(
-                    f"✅ {outline.title} 规划生成完成 ({len(chapter_plans)} 章)",
-                    progress + 3
+                yield await tracker.generating(
+                    current_chars=(idx + 0.5) * chapters_per_outline * 500,
+                    estimated_total=total_outlines * chapters_per_outline * 500,
+                    message=f"✅ {outline.title} 规划生成完成 ({len(chapter_plans)} 章)"
                 )
                 
                 created_chapters = None
@@ -3540,9 +3128,10 @@ async def batch_expand_outlines_generator(
                     ]
                     total_chapters_created += len(chapters)
                     
-                    yield await SSEResponse.send_progress(
-                        f"💾 {outline.title} 章节创建完成 ({len(chapters)} 章)",
-                        progress + 4
+                    yield await tracker.generating(
+                        current_chars=(idx + 1) * chapters_per_outline * 500,
+                        estimated_total=total_outlines * chapters_per_outline * 500,
+                        message=f"💾 {outline.title} 章节创建完成 ({len(chapters)} 章)"
                     )
                 
                 expansion_results.append({
@@ -3559,9 +3148,8 @@ async def batch_expand_outlines_generator(
                 
             except Exception as e:
                 logger.error(f"展开大纲 {outline.id} 失败: {str(e)}", exc_info=True)
-                yield await SSEResponse.send_progress(
-                    f"❌ {outline.title} 展开失败: {str(e)}",
-                    progress
+                yield await tracker.warning(
+                    f"❌ {outline.title} 展开失败: {str(e)}"
                 )
                 expansion_results.append({
                     "outline_id": outline.id,
@@ -3574,11 +3162,13 @@ async def batch_expand_outlines_generator(
                     "error": str(e)
                 })
         
-        yield await SSEResponse.send_progress("整理结果数据...", 95)
+        yield await tracker.parsing("整理结果数据...")
         
         db_committed = True
         
         logger.info(f"批量展开完成: {len(expansion_results)} 个大纲，跳过 {len(skipped_outlines)} 个，共生成 {total_chapters_created} 个章节")
+        
+        yield await tracker.complete()
         
         # 发送最终结果
         result_data = {
@@ -3601,9 +3191,8 @@ async def batch_expand_outlines_generator(
             ]
         }
         
-        yield await SSEResponse.send_result(result_data)
-        yield await SSEResponse.send_progress("🎉 批量展开完成!", 100, "success")
-        yield await SSEResponse.send_done()
+        yield await tracker.result(result_data)
+        yield await tracker.done()
         
     except GeneratorExit:
         logger.warning("批量展开生成器被提前关闭")
