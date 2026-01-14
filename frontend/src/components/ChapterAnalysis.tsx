@@ -55,6 +55,7 @@ export default function ChapterAnalysis({ chapterId, visible, onClose }: Chapter
       window.removeEventListener('resize', handleResize);
       // 清除可能存在的轮询
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, chapterId]);
 
   // 🔧 新增：独立的章节信息加载函数
@@ -634,21 +635,19 @@ export default function ChapterAnalysis({ chapterId, visible, onClose }: Chapter
       title="章节分析"
       open={visible}
       onCancel={onClose}
-      width={isMobile ? '100%' : '90%'}
-      centered={!isMobile}
+      width={isMobile ? 'calc(100vw - 32px)' : '90%'}
+      centered
       style={{
-        maxWidth: isMobile ? '100%' : '1400px',
-        paddingBottom: 0,
-        top: isMobile ? 0 : undefined,
-        margin: isMobile ? 0 : undefined,
-        maxHeight: isMobile ? '100vh' : undefined
+        maxWidth: isMobile ? 'calc(100vw - 32px)' : '1400px',
+        margin: isMobile ? '0 auto' : undefined,
+        padding: isMobile ? '0 16px' : undefined
       }}
       styles={{
         body: {
           padding: isMobile ? '12px' : '24px',
           paddingBottom: 0,
-          maxHeight: isMobile ? 'calc(100vh - 110px)' : undefined,
-          overflowY: isMobile ? 'auto' : undefined
+          maxHeight: isMobile ? 'calc(100vh - 200px)' : 'calc(90vh - 150px)',
+          overflowY: 'auto'
         }
       }}
       footer={[

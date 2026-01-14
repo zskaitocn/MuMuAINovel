@@ -192,7 +192,7 @@ export const settingsApi = {
   getAvailableModels: (params: { api_key: string; api_base_url: string; provider: string }) =>
     api.get<unknown, { provider: string; models: Array<{ value: string; label: string; description: string }>; count?: number }>('/settings/models', { params }),
 
-  testApiConnection: (params: { api_key: string; api_base_url: string; provider: string; llm_model: string }) =>
+  testApiConnection: (params: { api_key: string; api_base_url: string; provider: string; llm_model: string; temperature?: number; max_tokens?: number }) =>
     api.post<unknown, {
       success: boolean;
       message: string;
@@ -200,7 +200,7 @@ export const settingsApi = {
       provider?: string;
       model?: string;
       response_preview?: string;
-      details?: Record<string, boolean>;
+      details?: Record<string, boolean | number>;
       error?: string;
       error_type?: string;
       suggestions?: string[];
@@ -289,7 +289,13 @@ export const projectApi = {
   },
 
   // 导出项目数据为JSON
-  exportProjectData: async (id: string, options: { include_generation_history?: boolean; include_writing_styles?: boolean }) => {
+  exportProjectData: async (id: string, options: {
+    include_generation_history?: boolean;
+    include_writing_styles?: boolean;
+    include_careers?: boolean;
+    include_memories?: boolean;
+    include_plot_analysis?: boolean;
+  }) => {
     const response = await axios.post(
       `/api/projects/${id}/export-data`,
       options,
